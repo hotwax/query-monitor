@@ -1,0 +1,158 @@
+// Prisma schema for the Query Monitor app's own metadata store.
+// This database is separate from the MySQL RDS instances being monitored —
+// it only holds app users, the registry of monitored DB machines, encrypted
+// credentials, and the audit log.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  // The app's own metadata store (users, DB machine registry, audit log) —
+  // runs as its own Postgres service in docker-compose.yml. Not the same
+  // database as the MySQL/Aurora instances being monitored.
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String   @id @default(cuid())
+  username     String   @unique
+  name         String
+  email        String   @unique
+  /// One of "DEVELOPER" | "DEVOPS" | "ADMIN" — see src/lib/types.ts Role.
+  /// (Modeled as a plain string because SQLite, used for local dev/demo,
+  /// has no native enum type; Postgres/MySQL deployments can switch this
+  /// back to a real `enum Role` if preferred.)
+  role         String
+  /// One of "INVITED" | "ACTIVE" | "DISABLED" — see src/lib/types.ts
+  /// UserStatus. An invited user has no passwordHash yet and cannot log in
+  /// until they accept their invite; a disabled user is blocked at login
+  /// regardless of a valid password (offboarding).
+  status       String   @default("ACTIVE")
+  /// Null only for an INVITED user who hasn't accepted their invite yet —
+  /// they authenticate via inviteTokenHash instead until then.
+  passwordHash String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  // --- Invite flow (admin-created users) ---------------------------------
+  /// SHA-256 hash of the random token emailed to an invited user — never
+  /// store the raw token. Cleared once the invite is accepted.
+  inviteTokenHash  String?
+  inviteExpiresAt  DateTime?
+
+  // --- MFA (TOTP via Google/Microsoft Authenticator, RFC 6238) -----------
+  /// True once the user has scanned a QR code and confirmed a code back —
+  /// only then is mfaSecretEnc trusted for login. False forces the user
+  /// through /mfa/setup on next successful password check, before they get
+  /// a real session — see src/lib/mfa.ts.
+  mfaEnabled          Boolean   @default(false)
+  /// AES-256-GCM encrypted TOTP secret (see src/lib/crypto.ts), set only
+  /// once setup is confirmed.
+  mfaSecretEnc        String?
+  /// Encrypted secret generated during an in-progress setup, not yet
+  /// confirmed by a correct code. Promoted to mfaSecretEnc on confirm,
+  /// discarded on a fresh setup attempt.
+  mfaPendingSecretEnc String?
+  /// JSON array of {hash, usedAt} — bcrypt hashes of one-time backup codes,
+  /// generated (and shown once, in plaintext) whenever setup is confirmed.
+  /// A code is never removed, only marked usedAt, so it can't be replayed.
+  mfaBackupCodesJson  String?
+  /// Failed-code lockout for the MFA verify step, mirroring how a wrong
+  /// password could otherwise be brute-forced against a 6-digit code.
+  mfaFailedAttempts   Int       @default(0)
+  mfaLockedUntil      DateTime?
+  /// SHA-256 hash of the token emailed for "lost your device" recovery —
+  /// entering it lets the user redo MFA setup (a fresh QR code) without
+  /// logging in first; it never logs them in directly. See
+  /// prisma/schema.prisma AuditLog action MFA_RESET_VIA_EMAIL.
+  mfaResetTokenHash   String?
+  mfaResetExpiresAt   DateTime?
+
+  auditLogs    AuditLog[]
+}
+
+/// One row per monitored database machine (an RDS/Aurora MySQL instance, or
+/// a local MySQL/MariaDB for testing).
+///
+/// `monitorUsername` / `monitorPasswordEnc` are OPTIONAL: by default every
+/// DB Machine is polled using the shared read-only user you create yourself
+/// (see prisma/rds-readonly-user.sql) and hand to the app via the
+/// MONITOR_DB_USERNAME / MONITOR_DB_PASSWORD environment variables — never
+/// typed into this app. Set these two fields on a specific machine only if
+/// that one instance needs a differently named/scoped read-only user; see
+/// src/lib/monitor-credentials.ts for the resolution order.
+///
+/// `killUsername` / `killPasswordEnc` follow the exact same optional-override
+/// pattern for the DEDICATED kill account (see src/lib/kill-credentials.ts
+/// and prisma/rds-kill-user.sql) — by default every machine uses the shared
+/// KILL_DB_USERNAME / KILL_DB_PASSWORD env vars.
+model DbConnection {
+  id                  String   @id @default(cuid())
+  name                String   @unique // human alias, e.g. "prod-orders-mysql"
+  host                String
+  port                Int      @default(3306)
+  monitorUsername     String?
+  monitorPasswordEnc  String?
+  killUsername        String?
+  killPasswordEnc     String?
+  /// "RDS_PROCEDURE" (default) generates commands using AWS RDS/Aurora's
+  /// built-in mysql.rds_kill / mysql.rds_kill_query procedures — these work
+  /// without SUPER/CONNECTION_ADMIN, which RDS does not let you grant on
+  /// current-generation MySQL/Aurora versions anyway. "DIRECT_KILL" instead
+  /// generates a plain `KILL <id>;`, for a self-managed MySQL/MariaDB
+  /// instance where the kill account has been directly granted
+  /// CONNECTION_ADMIN or SUPER. See prisma/rds-kill-user.sql.
+  killMethod          String   @default("RDS_PROCEDURE")
+  /// Host to print in generated kill commands, if different from `host`.
+  /// Matters when the APP CONTAINER and the HUMAN COPY-PASTING THE COMMAND
+  /// reach the database by different names — the classic case being local
+  /// Docker testing, where the app must connect via "host.docker.internal"
+  /// but that name only resolves inside a container, not in your own
+  /// terminal. Leave blank and `host` is used for both (the normal case
+  /// for a real RDS/Aurora endpoint, reachable the same way from both).
+  killCommandHost     String?
+  notes               String?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  // --- AWS CloudWatch monitoring (see "Monitoring" nav page) -------------
+  /// The RDS/Aurora "DB instance identifier" as it appears in the AWS
+  /// console (e.g. "oms-prod", "oms-prod-readreplica2") — NOT the same
+  /// string as `host` above. This is what CloudWatch's AWS/RDS metrics are
+  /// keyed by (dimension DBInstanceIdentifier), so it has to be entered
+  /// once by hand here; there's no reliable way to derive it from a
+  /// hostname alone. Leave blank and the Monitoring page just shows this
+  /// machine as "not configured for AWS monitoring" — everything else in
+  /// the app (query/lock monitoring, kill) is unaffected either way.
+  awsDbInstanceIdentifier String?
+  /// True for a read replica. Purely a display/ordering hint for the
+  /// Monitoring page — a replica's most important metric is ReplicaLag
+  /// (shown first), which doesn't exist/apply to a primary instance.
+  isReadReplica           Boolean  @default(false)
+  /// Per-machine AWS region override for CloudWatch calls. CloudWatch
+  /// metrics are always scoped to one region per request, and it's
+  /// entirely normal for different machines to live in different regions
+  /// (e.g. a prod instance + its replicas in one region, a UAT instance in
+  /// another) — a single global default can't cover that. Leave blank to
+  /// fall back to the app-wide AWS_REGION env var; only set this if a
+  /// specific machine is in a different region than that default.
+  awsRegion               String?
+
+  auditLogs AuditLog[]
+}
+
+/// Append-only audit trail. Deliberately never stores plaintext passwords —
+/// only who did what, when, and against which connection/process.
+model AuditLog {
+  id           String   @id @default(cuid())
+  actorEmail   String
+  actorId      String?
+  actor        User?    @relation(fields: [actorId], references: [id])
+  action       String   // e.g. "LOGIN", "VIEW_QUERIES", "REVEAL_KILL_COMMAND"
+  connectionId String?
+  connection   DbConnection? @relation(fields: [connectionId], references: [id])
+  detail       String?  // small JSON blob, e.g. {"processId":123,"dbUsername":"order_svc"}
+  createdAt    DateTime @default(now())
+}

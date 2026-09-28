@@ -1,0 +1,67 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "${APP_PORT:-3000}:3000"
+    environment:
+      PORT: 3000
+      DATABASE_URL: "postgresql://${POSTGRES_USER:-qmon}:${POSTGRES_PASSWORD:-qmon_pw}@db:5432/${POSTGRES_DB:-query_monitor}"
+      APP_ENCRYPTION_KEY: "${APP_ENCRYPTION_KEY:?set APP_ENCRYPTION_KEY in .env, e.g. via openssl rand -base64 32}"
+      SESSION_SECRET: "${SESSION_SECRET:?set SESSION_SECRET in .env, e.g. via openssl rand -base64 32}"
+      # The read-only MySQL user YOU create yourself (see
+      # prisma/rds-readonly-user.sql) — never entered into the app's UI.
+      MONITOR_DB_USERNAME: "${MONITOR_DB_USERNAME:?set MONITOR_DB_USERNAME in .env}"
+      MONITOR_DB_PASSWORD: "${MONITOR_DB_PASSWORD:?set MONITOR_DB_PASSWORD in .env}"
+      # The dedicated kill account YOU create yourself (see
+      # prisma/rds-kill-user.sql) — never entered into the app's UI.
+      KILL_DB_USERNAME: "${KILL_DB_USERNAME:?set KILL_DB_USERNAME in .env}"
+      KILL_DB_PASSWORD: "${KILL_DB_PASSWORD:?set KILL_DB_PASSWORD in .env}"
+      # Sends invite / MFA-recovery emails via AWS SES's SMTP interface —
+      # see .env.example. Left un-required (no :?) because the app falls
+      # back to logging emails to the console when these aren't all set, so
+      # it still runs without them; you just won't get real emails.
+      SES_SMTP_USERNAME: "${SES_SMTP_USERNAME:-}"
+      SES_SMTP_PASSWORD: "${SES_SMTP_PASSWORD:-}"
+      SES_REGION: "${SES_REGION:-us-east-1}"
+      SES_SMTP_PORT: "${SES_SMTP_PORT:-587}"
+      SES_FROM_EMAIL: "${SES_FROM_EMAIL:-}"
+      APP_BASE_URL: "${APP_BASE_URL:?set APP_BASE_URL in .env, e.g. https://query-monitor.internal.hotwax.io}"
+      # Powers the "Monitoring" nav page (CloudWatch graphs) — see
+      # .env.example. Left un-required (no :?) because the app falls back
+      # to a "not configured" notice on that page when these aren't all
+      # set, so it still runs without them.
+      AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID:-}"
+      AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY:-}"
+      AWS_REGION: "${AWS_REGION:-us-east-1}"
+      QUERY_POLL_INTERVAL_MS: "${QUERY_POLL_INTERVAL_MS:-5000}"
+      LONG_QUERY_THRESHOLD_SECONDS: "${LONG_QUERY_THRESHOLD_SECONDS:-5}"
+    depends_on:
+      db:
+        condition: service_healthy
+    # Lets the container reach a MySQL/MariaDB instance running directly on
+    # your host machine (e.g. the local u80/u81 databases you're testing
+    # against) via the hostname "host.docker.internal", on Linux as well as
+    # Docker Desktop (Mac/Windows, where this already works out of the box).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-qmon}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-qmon_pw}
+      POSTGRES_DB: ${POSTGRES_DB:-query_monitor}
+    volumes:
+      - query_monitor_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-qmon} -d ${POSTGRES_DB:-query_monitor}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  query_monitor_pgdata:
