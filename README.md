@@ -294,13 +294,24 @@ History" checkbox in that machine's row.
 
 Once on for a machine, a background job built into the app itself checks
 that machine every ~2 minutes (`SLOW_QUERY_SCAN_INTERVAL_MS`, default
-120000ms) for any query that's been running 30 minutes or more — no
-external cron, no separate worker process, and it keeps running whether or
-not anyone has the app open in a browser. It's implemented as a Next.js
+120000ms) for any query that's been running 30 minutes or more
+(`SLOW_QUERY_MIN_DURATION_SECONDS`, default 1800) — no external cron, no
+separate worker process, and it keeps running whether or not anyone has
+the app open in a browser. It's implemented as a Next.js
 `instrumentation.ts` hook (`src/instrumentation.ts` calls
 `startSlowQueryScanner()` from `src/lib/slow-query-scanner.ts`), which
 requires `experimental.instrumentationHook: true` in `next.config.mjs` on
 this project's Next.js version — already set, nothing extra to configure.
+
+**For quick end-to-end testing** (rather than waiting 30 real minutes),
+lower both of those in `.env` — e.g. `SLOW_QUERY_SCAN_INTERVAL_MS=30000`
+(scan every 30s) and `SLOW_QUERY_MIN_DURATION_SECONDS=300` (5-minute
+floor) — then restart the container (no rebuild needed, these are read at
+runtime). A query caught this way still shows up labeled "Warning (30–60
+min)" — that's the tier label, not literally how long it ran; the real
+duration is always shown next to it. Remove both (or set them back to
+their defaults) once you're done testing, so production behaves as
+documented above.
 
 Every entry shows the actual elapsed time (e.g. "1 hr 24 min"), not just a
 severity badge, and falls into one of four severity tiers based on how long
