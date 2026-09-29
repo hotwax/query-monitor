@@ -128,6 +128,37 @@ async function queryLockWaits(conn: mysql.Connection): Promise<Omit<LockWait, "c
   }));
 }
 
+// information_schema.processlist requires the PROCESS privilege to see
+// other users' threads (RDS/Aurora support this for a plain grant, no
+// SUPER needed). We exclude our own monitoring connection and idle
+// sleeping connections, and only keep genuinely executing queries.
+const PROCESSLIST_SQL = `
+  SELECT ID, USER, HOST, DB, COMMAND, TIME, STATE, INFO
+  FROM information_schema.PROCESSLIST
+  WHERE COMMAND NOT IN ('Sleep', 'Daemon', 'Binlog Dump')
+    AND USER != ?
+    AND TIME >= ?
+  ORDER BY TIME DESC
+`;
+
+function mapProcesslistRows(
+  rows: mysql.RowDataPacket[],
+  connection: Pick<DbConnection, "id" | "name">
+): RunningQuery[] {
+  return rows.map((row) => ({
+    connectionId: connection.id,
+    connectionName: connection.name,
+    processId: Number(row.ID),
+    dbUsername: String(row.USER),
+    clientHost: row.HOST ? String(row.HOST) : null,
+    database: row.DB ? String(row.DB) : null,
+    command: String(row.COMMAND),
+    durationSeconds: Number(row.TIME),
+    state: row.STATE ? String(row.STATE) : null,
+    queryText: row.INFO ? String(row.INFO) : null,
+  }));
+}
+
 /**
  * Connects to one registered MySQL/MariaDB machine using its dedicated
  * READ-ONLY monitoring user (see prisma/rds-readonly-user.sql) and returns
@@ -157,37 +188,43 @@ export async function collectMachineData(
   });
 
   try {
-    // information_schema.processlist requires the PROCESS privilege to see
-    // other users' threads (RDS/Aurora support this for a plain grant,
-    // no SUPER needed). We exclude our own monitoring connection and idle
-    // sleeping connections, and only keep genuinely executing queries.
-    const [rows] = await conn.query<mysql.RowDataPacket[]>(
-      `SELECT ID, USER, HOST, DB, COMMAND, TIME, STATE, INFO
-       FROM information_schema.PROCESSLIST
-       WHERE COMMAND NOT IN ('Sleep', 'Daemon', 'Binlog Dump')
-         AND USER != ?
-         AND TIME >= ?
-       ORDER BY TIME DESC`,
-      [username, minDurationSeconds]
-    );
-
-    const queries = rows.map((row) => ({
-      connectionId: connection.id,
-      connectionName: connection.name,
-      processId: Number(row.ID),
-      dbUsername: String(row.USER),
-      clientHost: row.HOST ? String(row.HOST) : null,
-      database: row.DB ? String(row.DB) : null,
-      command: String(row.COMMAND),
-      durationSeconds: Number(row.TIME),
-      state: row.STATE ? String(row.STATE) : null,
-      queryText: row.INFO ? String(row.INFO) : null,
-    }));
+    const [rows] = await conn.query<mysql.RowDataPacket[]>(PROCESSLIST_SQL, [username, minDurationSeconds]);
+    const queries = mapProcesslistRows(rows, connection);
 
     const lockWaitRows = await queryLockWaits(conn);
     const lockWaits = lockWaitRows.map((lw) => ({ ...lw, connectionId: connection.id, connectionName: connection.name }));
 
     return { queries, lockWaits };
+  } finally {
+    await conn.end().catch(() => undefined);
+  }
+}
+
+/**
+ * A lighter version of collectMachineData for the slow-query history
+ * scanner (src/lib/slow-query-scanner.ts): just the PROCESSLIST query,
+ * none of the lock-wait detection — that scanner runs every couple of
+ * minutes against every tracking-enabled machine, so it deliberately
+ * skips work it doesn't need rather than reusing collectMachineData and
+ * discarding half the result.
+ */
+export async function collectLongRunningQueriesOnly(
+  connection: Pick<DbConnection, "id" | "name" | "host" | "port" | "monitorUsername" | "monitorPasswordEnc">,
+  minDurationSeconds: number
+): Promise<RunningQuery[]> {
+  const { username, password } = resolveMonitorCredentials(connection);
+
+  const conn = await mysql.createConnection({
+    host: connection.host,
+    port: connection.port,
+    user: username,
+    password,
+    connectTimeout: CONNECT_TIMEOUT_MS,
+  });
+
+  try {
+    const [rows] = await conn.query<mysql.RowDataPacket[]>(PROCESSLIST_SQL, [username, minDurationSeconds]);
+    return mapProcesslistRows(rows, connection);
   } finally {
     await conn.end().catch(() => undefined);
   }

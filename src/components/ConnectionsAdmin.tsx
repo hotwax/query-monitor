@@ -15,6 +15,7 @@ interface Connection {
   awsDbInstanceIdentifier: string | null;
   isReadReplica: boolean;
   awsRegion: string | null;
+  slowQueryTrackingEnabled: boolean;
 }
 
 const emptyForm = {
@@ -40,6 +41,7 @@ export default function ConnectionsAdmin() {
   const [saving, setSaving] = useState(false);
   const [editingAwsId, setEditingAwsId] = useState<string | null>(null);
   const [awsEditForm, setAwsEditForm] = useState({ awsDbInstanceIdentifier: "", isReadReplica: false, awsRegion: "" });
+  const [togglingTrackingId, setTogglingTrackingId] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     const res = await fetch("/api/connections");
@@ -98,10 +100,29 @@ export default function ConnectionsAdmin() {
     await load();
   }
 
+  async function toggleSlowQueryTracking(id: string, next: boolean) {
+    setTogglingTrackingId(id);
+    try {
+      await fetch(`/api/connections/${id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ slowQueryTrackingEnabled: next }),
+      });
+      await load();
+    } finally {
+      setTogglingTrackingId(null);
+    }
+  }
+
   return (
     <div style={{ display: "grid", gridTemplateColumns: "1fr 420px", gap: 20 }}>
       <div className="card">
         <p className="section-title">Registered database machines</p>
+        <p className="muted" style={{ fontSize: 12, marginTop: -6, marginBottom: 12 }}>
+          &quot;Query History&quot; turns on the permanent slow-query log for that machine (see the
+          Query History nav page) — off by default for every machine, including ones registered
+          before this feature existed. Checked every ~2 minutes in the background once on.
+        </p>
         <table>
           <thead>
             <tr>
@@ -111,6 +132,7 @@ export default function ConnectionsAdmin() {
               <th>Kill account</th>
               <th>Kill method</th>
               <th>AWS monitoring</th>
+              <th>Query History</th>
               <th></th>
             </tr>
           </thead>
@@ -182,6 +204,17 @@ export default function ConnectionsAdmin() {
                   )}
                 </td>
                 <td>
+                  <label style={{ fontSize: 12, display: "flex", alignItems: "center", gap: 6 }}>
+                    <input
+                      type="checkbox"
+                      checked={c.slowQueryTrackingEnabled}
+                      disabled={togglingTrackingId === c.id}
+                      onChange={(e) => toggleSlowQueryTracking(c.id, e.target.checked)}
+                    />
+                    {c.slowQueryTrackingEnabled ? "On" : "Off"}
+                  </label>
+                </td>
+                <td>
                   <button className="secondary" onClick={() => remove(c.id)}>
                     Remove
                   </button>
@@ -190,7 +223,7 @@ export default function ConnectionsAdmin() {
             ))}
             {connections.length === 0 && (
               <tr>
-                <td colSpan={7} className="muted">
+                <td colSpan={8} className="muted">
                   No database machines registered yet.
                 </td>
               </tr>

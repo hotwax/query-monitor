@@ -279,6 +279,54 @@ Older entries from before the app executed kills itself — "Viewed command"
 and "Confirmed killed (legacy)" — stay visible in the log for history, but
 nothing generates them anymore.
 
+## Query History (slow-query log)
+
+The live **Dashboard** only ever shows what's running *right now* — the
+moment a query finishes, it's gone. **Query History** (in the nav bar, any
+logged-in role) is a separate, permanent record of every query that ran 30
+minutes or longer, so a query that took an hour last night is still there
+to look at this morning.
+
+**It's off by default for every machine**, including ones you registered
+before this feature existed — nothing is tracked until you turn it on.
+Enable it per machine from **DB Machines** (DevOps/Admin), with the "Query
+History" checkbox in that machine's row.
+
+Once on for a machine, a background job built into the app itself checks
+that machine every ~2 minutes (`SLOW_QUERY_SCAN_INTERVAL_MS`, default
+120000ms) for any query that's been running 30 minutes or more — no
+external cron, no separate worker process, and it keeps running whether or
+not anyone has the app open in a browser. It's implemented as a Next.js
+`instrumentation.ts` hook (`src/instrumentation.ts` calls
+`startSlowQueryScanner()` from `src/lib/slow-query-scanner.ts`), which
+requires `experimental.instrumentationHook: true` in `next.config.mjs` on
+this project's Next.js version — already set, nothing extra to configure.
+
+Every entry shows the actual elapsed time (e.g. "1 hr 24 min"), not just a
+severity badge, and falls into one of four severity tiers based on how long
+it ran:
+
+| Tier | Duration |
+| --- | --- |
+| Warning | 30 – 60 minutes |
+| Long | 1 – 2 hours |
+| Critical | 2 – 3 hours |
+| Severe | 3+ hours (open-ended — nothing past 3 hours falls through a gap) |
+
+A query is tracked continuously while it keeps running (its entry's
+duration keeps growing, its severity tier updates if it crosses into the
+next one) and is marked "Ended" once it's no longer seen — either because
+it finished, or because something (including Kill Query) ended it.
+
+The Query History page can be filtered by machine, by database name, by
+severity, and by date range — any combination at once — and the same
+filters apply to **Export to Excel**, which downloads a real `.xlsx` file
+(via `exceljs`, server-side) of exactly what's currently filtered.
+
+Entries older than 30 days are deleted automatically once a day
+(`SLOW_QUERY_RETENTION_DAYS`, default 30) — this is a rolling window, not
+an archive; export anything you want to keep past that.
+
 ## Multi-factor authentication (MFA)
 
 Every account — no exceptions, no per-role opt-out — has to complete TOTP

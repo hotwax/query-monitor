@@ -21,6 +21,7 @@ export async function GET() {
       awsDbInstanceIdentifier: true,
       isReadReplica: true,
       awsRegion: true,
+      slowQueryTrackingEnabled: true,
       createdAt: true,
     },
     orderBy: { name: "asc" },

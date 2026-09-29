@@ -35,7 +35,11 @@ export async function logAudit(params: {
     | "USER_INVITE_RESENT"
     | "USER_INVITE_ACCEPTED"
     | "USER_DISABLED"
-    | "USER_ENABLED";
+    | "USER_ENABLED"
+    // Slow query history (see /query-history and src/lib/slow-query-scanner.ts):
+    | "SLOW_QUERY_TRACKING_ENABLED"
+    | "SLOW_QUERY_TRACKING_DISABLED"
+    | "SLOW_QUERY_HISTORY_EXPORTED";
   connectionId?: string;
   detail?: Record<string, unknown>;
 }) {

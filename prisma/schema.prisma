@@ -140,7 +140,78 @@ model DbConnection {
   /// specific machine is in a different region than that default.
   awsRegion               String?
 
+  // --- Slow query history (see "Query History" nav page) -----------------
+  /// Off by default for every machine, including ones registered before
+  /// this feature existed — nothing is recorded for a machine until an
+  /// admin deliberately turns this on from the DB Machines page. Keeps the
+  /// history log scoped to only the databases you actually want a
+  /// permanent record for.
+  slowQueryTrackingEnabled Boolean @default(false)
+
   auditLogs AuditLog[]
+  slowQueryLogs SlowQueryLog[]
+}
+
+/// A permanent record of one query that ran past 30 minutes, kept for 30
+/// days regardless of whether anyone had the app open when it happened —
+/// see src/lib/slow-query-scanner.ts, which checks every registered
+/// machine with slowQueryTrackingEnabled on, on its own, every couple of
+/// minutes. This is deliberately separate from the live "long-running
+/// queries" view on the Dashboard (which shows only what's running RIGHT
+/// NOW and keeps nothing once a query finishes) — the point of this table
+/// is to survive past that moment so you can come back later and work
+/// through what happened, and export it.
+///
+/// One row generally represents one continuous slow-running occurrence,
+/// not one poll: while MySQL's PROCESSLIST id (processId) is normally
+/// stable for the life of a connection, it CAN be reused by a later,
+/// unrelated connection once the original disconnects. The scanner
+/// guards against mistaking a reused id for the same occurrence by also
+/// checking that the newly observed duration is consistent with the
+/// previous poll's (a genuinely continuing query's duration only grows) —
+/// see matchExistingOccurrence() in src/lib/slow-query-scanner.ts.
+model SlowQueryLog {
+  id           String   @id @default(cuid())
+  connectionId String?
+  connection   DbConnection? @relation(fields: [connectionId], references: [id], onDelete: SetNull)
+  /// Snapshot of the machine's name at detection time, so history stays
+  /// readable even if the machine is later renamed or removed.
+  connectionName String
+  /// The MySQL schema this query ran against (PROCESSLIST's DB column) —
+  /// can be null (some connections aren't attached to a specific schema).
+  databaseName String?
+  dbUsername   String
+  clientHost   String?
+  queryText    String?
+  /// PROCESSLIST id (MySQL thread id) as of the most recent poll that saw
+  /// this occurrence — see the reuse-guard note above.
+  processId    Int
+  /// "WARNING" (30-60m) | "LONG" (1-2h) | "CRITICAL" (2-3h) | "SEVERE" (3h+)
+  /// — see src/lib/slow-query-categories.ts. Recomputed from
+  /// maxDurationSeconds every time this row is updated, so a query that
+  /// keeps running climbs through the tiers on its existing row rather
+  /// than creating a new one per tier.
+  category     String
+  /// "RUNNING" while still seen on the most recent scan for its machine,
+  /// "ENDED" once it stops appearing — MySQL gives no way to tell whether
+  /// that means it finished normally or was killed by something outside
+  /// this app, so "ENDED" is deliberately neutral about which.
+  status       String   @default("RUNNING")
+  firstDetectedAt DateTime @default(now())
+  lastSeenAt      DateTime @default(now())
+  /// Longest duration (in seconds) observed for this occurrence across
+  /// every poll — i.e. "approximately how long this query took/has taken."
+  maxDurationSeconds Int
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  // Retention cleanup (30 days) scans/deletes by firstDetectedAt; the
+  // filter UI queries by connection, database, category and date range —
+  // these indexes cover both.
+  @@index([firstDetectedAt])
+  @@index([connectionId, processId, status])
+  @@index([databaseName])
+  @@index([category])
 }
 
 /// Append-only audit trail. Deliberately never stores plaintext passwords —

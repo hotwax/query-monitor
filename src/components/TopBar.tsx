@@ -26,6 +26,7 @@ export default function TopBar({ email, role }: { email: string; role: Role }) {
       <nav style={{ display: "flex", alignItems: "center" }}>
         <Link href="/dashboard">Dashboard</Link>
         <Link href="/monitoring">Monitoring</Link>
+        <Link href="/query-history">Query History</Link>
         {canAdmin && <Link href="/admin/connections">DB Machines</Link>}
         {canAdmin && <Link href="/admin/kill-log">Kill Log</Link>}
         {canManageUsers && <Link href="/admin/users">Users</Link>}
