@@ -23,6 +23,12 @@ export async function logAudit(params: {
     | "CHECKED_STATUS"
     | "KILL_EXECUTED"
     | "KILL_FAILED"
+    // Refused outright, before ever attempting the kill — see the
+    // pre-kill PROCESSLIST check in kill-execute/route.ts. Fires for any
+    // account in NEVER_MONITOR_OR_KILL_USERS (mysql-collector.ts) —
+    // MySQL/MariaDB's own internal replication/handshake threads plus
+    // AWS RDS's internal management accounts — which must never be killed.
+    | "KILL_BLOCKED_SYSTEM_PROCESS"
     // MFA (see src/lib/mfa.ts and the /mfa/* routes/pages):
     | "MFA_ENABLED"
     | "MFA_LOGIN_SUCCESS"

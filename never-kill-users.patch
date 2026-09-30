@@ -1,0 +1,223 @@
+diff --git a/src/app/api/kill-execute/route.ts b/src/app/api/kill-execute/route.ts
+index 31b4559..15ea327 100644
+--- a/src/app/api/kill-execute/route.ts
++++ b/src/app/api/kill-execute/route.ts
+@@ -5,6 +5,7 @@ import { getSession } from "@/lib/session";
+ import { logAudit } from "@/lib/audit";
+ import { roleAllows, CAN_REVEAL_KILL_COMMAND } from "@/lib/rbac";
+ import { resolveKillCredentials } from "@/lib/kill-credentials";
++import { NEVER_MONITOR_OR_KILL_USERS } from "@/lib/mysql-collector";
+ 
+ const CONNECT_TIMEOUT_MS = 5000;
+ 
+@@ -104,6 +105,22 @@ export async function POST(req: NextRequest) {
+   // Number.isFinite above, never taken from a raw string.
+   const params = connection.killMethod === "DIRECT_KILL" ? [] : [processId];
+ 
++  // Never-kill list: MySQL/MariaDB/AWS-RDS-internal accounts. Derived from
++  // the SAME array mysql-collector.ts uses to keep these accounts off
++  // every list the app shows (see NEVER_MONITOR_OR_KILL_USERS there for
++  // the full, evidence-backed rationale for each entry) — one shared
++  // source of truth, so the display filter and this kill-safety gate can
++  // never drift out of sync. Killing one of these (e.g. a replica's
++  // replication threads, or an RDS-internal management account) risks
++  // breaking replication or RDS's own management of the instance, a far
++  // bigger incident than any slow query this app exists to catch. This is
++  // the actual safety boundary: it's checked here, live, right before the
++  // kill executes, using the CURRENT PROCESSLIST state rather than
++  // trusting whatever the client sent — so a stale UI, a reused/recycled
++  // process id, or a hand-crafted request all get the same protection,
++  // not just the dashboard's display.
++  const NEVER_KILL_USERS = new Set<string>(NEVER_MONITOR_OR_KILL_USERS);
++
+   let conn: mysql.Connection | null = null;
+   try {
+     conn = await mysql.createConnection({
+@@ -113,6 +130,43 @@ export async function POST(req: NextRequest) {
+       password,
+       connectTimeout: CONNECT_TIMEOUT_MS,
+     });
++
++    const [liveRows] = await conn.query<mysql.RowDataPacket[]>(
++      "SELECT USER FROM information_schema.PROCESSLIST WHERE ID = ?",
++      [processId]
++    );
++    const liveUser: string | null = liveRows[0]?.USER ?? null;
++
++    if (liveUser === null) {
++      await logAudit({
++        actorEmail: session.email,
++        actorId: session.sub,
++        action: "KILL_FAILED",
++        connectionId,
++        detail: { ...baseDetail, error: "process-no-longer-running" },
++      });
++      return NextResponse.json(
++        { error: `Process ${processId} is no longer running — nothing to kill.` },
++        { status: 409 }
++      );
++    }
++
++    if (NEVER_KILL_USERS.has(liveUser)) {
++      await logAudit({
++        actorEmail: session.email,
++        actorId: session.sub,
++        action: "KILL_BLOCKED_SYSTEM_PROCESS",
++        connectionId,
++        detail: { ...baseDetail, liveUser },
++      });
++      return NextResponse.json(
++        {
++          error: `Refused: process ${processId} belongs to MySQL/MariaDB's or AWS RDS's internal "${liveUser}" account. Killing it could break replication or RDS's own management of this instance. This app will never kill this account, regardless of what triggered the request.`,
++        },
++        { status: 403 }
++      );
++    }
++
+     await conn.query(statement, params);
+ 
+     await logAudit({
+diff --git a/src/lib/mysql-collector.ts b/src/lib/mysql-collector.ts
+index 78d9db9..2e8d9c4 100644
+--- a/src/lib/mysql-collector.ts
++++ b/src/lib/mysql-collector.ts
+@@ -128,14 +128,98 @@ async function queryLockWaits(conn: mysql.Connection): Promise<Omit<LockWait, "c
+   }));
+ }
+ 
++/**
++ * MySQL/MariaDB/AWS-RDS internal accounts that must never be shown as a
++ * "long-running query" and must never be killable through this app,
++ * regardless of how long they've been running or what their TIME value
++ * says. This is the single source of truth — both the PROCESSLIST query
++ * below (what the app ever displays) and the live pre-kill safety check in
++ * src/app/api/kill-execute/route.ts (what the app will ever execute a kill
++ * against) derive from this exact list, so the two can never drift apart.
++ *
++ * Every entry here is backed by real evidence, not just documentation —
++ * confirmed by running `SHOW PROCESSLIST` / a distinct-USER query against
++ * all 5 of this app's registered production/UAT instances (oms-uat,
++ * oms-prod [MAIN], gorjana-prod-rds-read, oms-prod-readreplica2,
++ * tathya-prod-readreplica) before this list was finalized:
++ *
++ * - 'system user'          — a replica's I/O/SQL replication threads.
++ *   Observed on every read replica (gorjana-prod-rds-read,
++ *   oms-prod-readreplica2, tathya-prod-readreplica) with TIME in the tens
++ *   of thousands of minutes (reflects time-in-current-state, typically
++ *   since the replica last restarted, not an actual stuck query). Killing
++ *   one breaks replication on that replica.
++ * - 'unauthenticated user' — a connection still mid-handshake. Too
++ *   transient to ever really land in a snapshot, but included defensively
++ *   since it's a MySQL/MariaDB-internal pseudo-account, never a real login.
++ * - 'rdsadmin'             — AWS RDS's own internal management account,
++ *   present on every registered instance (confirmed on all 5). Essential
++ *   for RDS-managed operations (backups, patching, monitoring).
++ * - 'rdsrepladmin'         — AWS RDS's own internal replication-management
++ *   account, confirmed present on the MAIN instance (oms-prod).
++ * - 'event_scheduler'      — MySQL's built-in thread for running scheduled
++ *   EVENTS, confirmed present with a low, steady connection count.
++ * - 'mysql.sys', 'mysql.session', 'mysql.infoschema' — MySQL 8.0+'s own
++ *   built-in ACCOUNT LOCKED system accounts (see MySQL Reference Manual
++ *   §8.2.9, "Reserved Accounts"). These can never actually log in, so
++ *   listing them is zero-risk and just future-proofs against a MySQL
++ *   version where that ever changed.
++ *
++ * Deliberately NOT included: 'admin' — despite superficially resembling an
++ * AWS-reserved name (Aurora's own reserved 'admin' cluster-management
++ * role), this deployment's actual 'admin' account is confirmed to be a
++ * real, actively-used human/testing login (low, human-shaped connection
++ * counts; seen running manual test queries from an external IP on the
++ * Dashboard). Excluding it would hide legitimate queries and, worse, make
++ * them unkillable.
++ *
++ * New RDS-internal accounts do turn up occasionally (e.g. if RDS Proxy or
++ * an Aurora multi-writer/active-active setup is ever adopted — see
++ * 'rdsproxyadmin', 'rdsrepladmin_priv_checks_user', 'rdsgrprepladmin' in
++ * AWS's docs). None of those are present on this deployment today, so
++ * they're deliberately left out rather than guessed at — add them here,
++ * backed by the same kind of real evidence, if that ever changes.
++ */
++export const NEVER_MONITOR_OR_KILL_USERS = [
++  "system user",
++  "unauthenticated user",
++  "rdsadmin",
++  "rdsrepladmin",
++  "event_scheduler",
++  "mysql.sys",
++  "mysql.session",
++  "mysql.infoschema",
++] as const;
++
+ // information_schema.processlist requires the PROCESS privilege to see
+ // other users' threads (RDS/Aurora support this for a plain grant, no
+ // SUPER needed). We exclude our own monitoring connection and idle
+ // sleeping connections, and only keep genuinely executing queries.
++//
++// Also excludes every account in NEVER_MONITOR_OR_KILL_USERS above (MySQL/
++// MariaDB/AWS-RDS-internal accounts). This matters well beyond just
++// tidying up the dashboard: a replica's replication threads, for example,
++// sit in PROCESSLIST essentially forever (TIME reflects how long the
++// thread has been in its current wait state, often since the replica last
++// restarted), so without this exclusion they show up as the most
++// "long-running" thing on the instance — get logged into Query History as
++// if they were a real problem query, AND appear as a normal-looking "Kill
++// Query" candidate. Killing an actual RDS-internal or replication account
++// can break replication or RDS's own management of the instance, a much
++// bigger incident than any slow query this app is meant to catch. See also
++// kill-execute/route.ts, which independently refuses to kill anything
++// still matching these accounts at the moment of the kill — this query
++// keeps them off the screen in the first place, that's the backstop if a
++// kill is attempted anyway.
++//
++// USER NOT IN (?) with a single array parameter is expanded by mysql2 into
++// the right number of bound placeholders — no string concatenation of
++// usernames into the SQL text.
+ const PROCESSLIST_SQL = `
+   SELECT ID, USER, HOST, DB, COMMAND, TIME, STATE, INFO
+   FROM information_schema.PROCESSLIST
+   WHERE COMMAND NOT IN ('Sleep', 'Daemon', 'Binlog Dump')
++    AND USER NOT IN (?)
+     AND USER != ?
+     AND TIME >= ?
+   ORDER BY TIME DESC
+@@ -188,7 +272,11 @@ export async function collectMachineData(
+   });
+ 
+   try {
+-    const [rows] = await conn.query<mysql.RowDataPacket[]>(PROCESSLIST_SQL, [username, minDurationSeconds]);
++    const [rows] = await conn.query<mysql.RowDataPacket[]>(PROCESSLIST_SQL, [
++      NEVER_MONITOR_OR_KILL_USERS,
++      username,
++      minDurationSeconds,
++    ]);
+     const queries = mapProcesslistRows(rows, connection);
+ 
+     const lockWaitRows = await queryLockWaits(conn);
+@@ -223,7 +311,11 @@ export async function collectLongRunningQueriesOnly(
+   });
+ 
+   try {
+-    const [rows] = await conn.query<mysql.RowDataPacket[]>(PROCESSLIST_SQL, [username, minDurationSeconds]);
++    const [rows] = await conn.query<mysql.RowDataPacket[]>(PROCESSLIST_SQL, [
++      NEVER_MONITOR_OR_KILL_USERS,
++      username,
++      minDurationSeconds,
++    ]);
+     return mapProcesslistRows(rows, connection);
+   } finally {
+     await conn.end().catch(() => undefined);
+--- a/src/lib/audit.ts
++++ b/src/lib/audit.ts
+@@ -23,6 +23,12 @@
+     | "CHECKED_STATUS"
+     | "KILL_EXECUTED"
+     | "KILL_FAILED"
++    // Refused outright, before ever attempting the kill — see the
++    // pre-kill PROCESSLIST check in kill-execute/route.ts. Fires for any
++    // account in NEVER_MONITOR_OR_KILL_USERS (mysql-collector.ts) —
++    // MySQL/MariaDB's own internal replication/handshake threads plus
++    // AWS RDS's internal management accounts — which must never be killed.
++    | "KILL_BLOCKED_SYSTEM_PROCESS"
+     // MFA (see src/lib/mfa.ts and the /mfa/* routes/pages):
+     | "MFA_ENABLED"
+     | "MFA_LOGIN_SUCCESS"

@@ -5,6 +5,7 @@ import { getSession } from "@/lib/session";
 import { logAudit } from "@/lib/audit";
 import { roleAllows, CAN_REVEAL_KILL_COMMAND } from "@/lib/rbac";
 import { resolveKillCredentials } from "@/lib/kill-credentials";
+import { NEVER_MONITOR_OR_KILL_USERS } from "@/lib/mysql-collector";
 
 const CONNECT_TIMEOUT_MS = 5000;
 
@@ -104,6 +105,22 @@ export async function POST(req: NextRequest) {
   // Number.isFinite above, never taken from a raw string.
   const params = connection.killMethod === "DIRECT_KILL" ? [] : [processId];
 
+  // Never-kill list: MySQL/MariaDB/AWS-RDS-internal accounts. Derived from
+  // the SAME array mysql-collector.ts uses to keep these accounts off
+  // every list the app shows (see NEVER_MONITOR_OR_KILL_USERS there for
+  // the full, evidence-backed rationale for each entry) — one shared
+  // source of truth, so the display filter and this kill-safety gate can
+  // never drift out of sync. Killing one of these (e.g. a replica's
+  // replication threads, or an RDS-internal management account) risks
+  // breaking replication or RDS's own management of the instance, a far
+  // bigger incident than any slow query this app exists to catch. This is
+  // the actual safety boundary: it's checked here, live, right before the
+  // kill executes, using the CURRENT PROCESSLIST state rather than
+  // trusting whatever the client sent — so a stale UI, a reused/recycled
+  // process id, or a hand-crafted request all get the same protection,
+  // not just the dashboard's display.
+  const NEVER_KILL_USERS = new Set<string>(NEVER_MONITOR_OR_KILL_USERS);
+
   let conn: mysql.Connection | null = null;
   try {
     conn = await mysql.createConnection({
@@ -113,6 +130,43 @@ export async function POST(req: NextRequest) {
       password,
       connectTimeout: CONNECT_TIMEOUT_MS,
     });
+
+    const [liveRows] = await conn.query<mysql.RowDataPacket[]>(
+      "SELECT USER FROM information_schema.PROCESSLIST WHERE ID = ?",
+      [processId]
+    );
+    const liveUser: string | null = liveRows[0]?.USER ?? null;
+
+    if (liveUser === null) {
+      await logAudit({
+        actorEmail: session.email,
+        actorId: session.sub,
+        action: "KILL_FAILED",
+        connectionId,
+        detail: { ...baseDetail, error: "process-no-longer-running" },
+      });
+      return NextResponse.json(
+        { error: `Process ${processId} is no longer running — nothing to kill.` },
+        { status: 409 }
+      );
+    }
+
+    if (NEVER_KILL_USERS.has(liveUser)) {
+      await logAudit({
+        actorEmail: session.email,
+        actorId: session.sub,
+        action: "KILL_BLOCKED_SYSTEM_PROCESS",
+        connectionId,
+        detail: { ...baseDetail, liveUser },
+      });
+      return NextResponse.json(
+        {
+          error: `Refused: process ${processId} belongs to MySQL/MariaDB's or AWS RDS's internal "${liveUser}" account. Killing it could break replication or RDS's own management of this instance. This app will never kill this account, regardless of what triggered the request.`,
+        },
+        { status: 403 }
+      );
+    }
+
     await conn.query(statement, params);
 
     await logAudit({
