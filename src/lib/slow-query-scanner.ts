@@ -1,6 +1,7 @@
 import { prisma } from "@/lib/db";
 import { collectLongRunningQueriesOnly } from "@/lib/mysql-collector";
-import { categorizeDuration, MIN_TRACKED_DURATION_SECONDS } from "@/lib/slow-query-categories";
+import { categorizeDuration } from "@/lib/slow-query-categories";
+import { getSlowQueryMinDurationSeconds } from "@/lib/app-settings";
 
 /**
  * Background recorder for the "Query History" page. Runs entirely inside
@@ -86,10 +87,10 @@ async function recordOccurrence(connection: TrackedConnection, q: Awaited<Return
   });
 }
 
-async function scanConnection(connection: TrackedConnection) {
+async function scanConnection(connection: TrackedConnection, minDurationSeconds: number) {
   let queries;
   try {
-    queries = await collectLongRunningQueriesOnly(connection, MIN_TRACKED_DURATION_SECONDS);
+    queries = await collectLongRunningQueriesOnly(connection, minDurationSeconds);
   } catch (err) {
     // Fail open — one unreachable machine shouldn't stop the others, and
     // we'll just try this one again on the next tick.
@@ -132,12 +133,18 @@ async function tick() {
   if (isTicking) return; // a previous tick is still running (slow/unreachable machine) — skip, try again next interval
   isTicking = true;
   try {
-    const connections = await prisma.dbConnection.findMany({
-      where: { slowQueryTrackingEnabled: true },
-      select: { id: true, name: true, host: true, port: true, monitorUsername: true, monitorPasswordEnc: true },
-    });
+    // Read fresh every tick (not once at startup) — this is what lets a
+    // value saved from the "Query History settings" UI take effect on the
+    // very next scan, rather than needing a restart the way an env var did.
+    const [connections, minDurationSeconds] = await Promise.all([
+      prisma.dbConnection.findMany({
+        where: { slowQueryTrackingEnabled: true },
+        select: { id: true, name: true, host: true, port: true, monitorUsername: true, monitorPasswordEnc: true },
+      }),
+      getSlowQueryMinDurationSeconds(),
+    ]);
 
-    await Promise.allSettled(connections.map((c) => scanConnection(c)));
+    await Promise.allSettled(connections.map((c) => scanConnection(c, minDurationSeconds)));
 
     const now = Date.now();
     if (now - lastCleanupAt > CLEANUP_INTERVAL_MS) {

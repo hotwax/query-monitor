@@ -16,19 +16,17 @@ export const DURATION_CATEGORIES: { value: DurationCategory; label: string; minM
   { value: "SEVERE", label: "Severe (3 hr+)", minMinutes: 180, maxMinutes: null },
 ];
 
-/**
- * The lowest duration (in seconds) this log tracks at all — anything under
- * this is never recorded. 30 minutes by default (matching the agreed
- * "Warning" tier's floor); override with SLOW_QUERY_MIN_DURATION_SECONDS
- * for quicker end-to-end testing (e.g. 300 for a 5-minute floor) without a
- * code change or rebuild — just set it in .env and restart the container.
- * Note that lowering it doesn't change the severity tiers themselves: a
- * query caught below the real 30-minute mark still shows up labeled
- * "Warning (30–60 min)" (the lowest tier categorizeDuration has), since
- * that label describes the tier, not literally how long this one query
- * ran — its actual duration is always shown alongside it regardless.
- */
-export const MIN_TRACKED_DURATION_SECONDS = Number(process.env.SLOW_QUERY_MIN_DURATION_SECONDS ?? 30 * 60);
+// The lowest duration this log tracks at all used to live here as a fixed,
+// env-var-backed constant. It's now a database-backed, admin-editable
+// setting instead — see getSlowQueryMinDurationSeconds in
+// src/lib/app-settings.ts (and the "Query History settings" card on the DB
+// Machines page) — so it can be changed from inside the app itself, with no
+// .env edit or restart needed. Note that lowering it doesn't change the
+// severity tiers themselves: a query caught below the real 30-minute mark
+// still shows up labeled "Warning (30–60 min)" (the lowest tier
+// categorizeDuration has), since that label describes the tier, not
+// literally how long this one query ran — its actual duration is always
+// shown alongside it regardless.
 
 export function isDurationCategory(value: string): value is DurationCategory {
   return DURATION_CATEGORIES.some((c) => c.value === value);

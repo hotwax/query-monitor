@@ -39,7 +39,10 @@ export async function logAudit(params: {
     // Slow query history (see /query-history and src/lib/slow-query-scanner.ts):
     | "SLOW_QUERY_TRACKING_ENABLED"
     | "SLOW_QUERY_TRACKING_DISABLED"
-    | "SLOW_QUERY_HISTORY_EXPORTED";
+    | "SLOW_QUERY_HISTORY_EXPORTED"
+    // The global "how long before it counts as long-running" floor — see
+    // src/lib/app-settings.ts and the DB Machines page's settings card:
+    | "SLOW_QUERY_MIN_DURATION_CHANGED";
   connectionId?: string;
   detail?: Record<string, unknown>;
 }) {

@@ -43,15 +43,62 @@ export default function ConnectionsAdmin() {
   const [awsEditForm, setAwsEditForm] = useState({ awsDbInstanceIdentifier: "", isReadReplica: false, awsRegion: "" });
   const [togglingTrackingId, setTogglingTrackingId] = useState<string | null>(null);
 
+  // "Minimum duration to track" (Query History floor) — a single app-wide
+  // setting stored in the database (see src/lib/app-settings.ts), edited
+  // here as whole minutes for readability even though it's stored/consumed
+  // in seconds everywhere else.
+  const [minDurationMinutes, setMinDurationMinutes] = useState<string>("30");
+  const [minDurationSaving, setMinDurationSaving] = useState(false);
+  const [minDurationError, setMinDurationError] = useState<string | null>(null);
+  const [minDurationSaved, setMinDurationSaved] = useState(false);
+
   const load = useCallback(async () => {
     const res = await fetch("/api/connections");
     const data = await res.json();
     setConnections(data.connections ?? []);
   }, []);
 
+  const loadMinDuration = useCallback(async () => {
+    const res = await fetch("/api/settings/query-history");
+    if (!res.ok) return;
+    const data = await res.json();
+    if (typeof data.slowQueryMinDurationSeconds === "number") {
+      setMinDurationMinutes(String(Math.round(data.slowQueryMinDurationSeconds / 60)));
+    }
+  }, []);
+
   useEffect(() => {
     load();
-  }, [load]);
+    loadMinDuration();
+  }, [load, loadMinDuration]);
+
+  async function saveMinDuration(e: React.FormEvent) {
+    e.preventDefault();
+    setMinDurationSaving(true);
+    setMinDurationError(null);
+    setMinDurationSaved(false);
+    try {
+      const minutes = Number(minDurationMinutes);
+      if (!Number.isFinite(minutes) || minutes <= 0) {
+        setMinDurationError("Enter a whole number of minutes greater than 0.");
+        return;
+      }
+      const res = await fetch("/api/settings/query-history", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ slowQueryMinDurationSeconds: Math.round(minutes * 60) }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setMinDurationError(data.error ?? "Could not save.");
+        return;
+      }
+      setMinDurationMinutes(String(Math.round(data.slowQueryMinDurationSeconds / 60)));
+      setMinDurationSaved(true);
+    } finally {
+      setMinDurationSaving(false);
+    }
+  }
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -115,7 +162,41 @@ export default function ConnectionsAdmin() {
   }
 
   return (
-    <div style={{ display: "grid", gridTemplateColumns: "1fr 420px", gap: 20 }}>
+    <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      <div className="card">
+        <p className="section-title">Query History settings</p>
+        <p className="muted" style={{ fontSize: 12, marginTop: -6, marginBottom: 12, maxWidth: 640 }}>
+          How long a query has to run before it&apos;s recorded permanently in Query History (see
+          the Query History nav page). Applies to every machine with tracking turned on below.
+          Saving here takes effect on the very next background scan — no restart needed.
+        </p>
+        {minDurationError && <div className="alert error">{minDurationError}</div>}
+        <form onSubmit={saveMinDuration} style={{ display: "flex", gap: 10, alignItems: "flex-end", flexWrap: "wrap" }}>
+          <div className="field" style={{ margin: 0 }}>
+            <label>Minimum duration to track (minutes)</label>
+            <input
+              type="number"
+              min={1}
+              value={minDurationMinutes}
+              onChange={(e) => {
+                setMinDurationMinutes(e.target.value);
+                setMinDurationSaved(false);
+              }}
+              style={{ width: 140 }}
+            />
+          </div>
+          <button type="submit" disabled={minDurationSaving}>
+            {minDurationSaving ? "Saving…" : "Save"}
+          </button>
+          {minDurationSaved && !minDurationSaving && (
+            <span className="muted" style={{ fontSize: 12 }}>
+              Saved — the scanner will use this from its next cycle.
+            </span>
+          )}
+        </form>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 420px", gap: 20 }}>
       <div className="card">
         <p className="section-title">Registered database machines</p>
         <p className="muted" style={{ fontSize: 12, marginTop: -6, marginBottom: 12 }}>
@@ -409,6 +490,7 @@ export default function ConnectionsAdmin() {
             {saving ? "Saving…" : "Add machine"}
           </button>
         </form>
+      </div>
       </div>
     </div>
   );

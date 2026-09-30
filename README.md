@@ -294,24 +294,30 @@ History" checkbox in that machine's row.
 
 Once on for a machine, a background job built into the app itself checks
 that machine every ~2 minutes (`SLOW_QUERY_SCAN_INTERVAL_MS`, default
-120000ms) for any query that's been running 30 minutes or more
-(`SLOW_QUERY_MIN_DURATION_SECONDS`, default 1800) — no external cron, no
-separate worker process, and it keeps running whether or not anyone has
-the app open in a browser. It's implemented as a Next.js
-`instrumentation.ts` hook (`src/instrumentation.ts` calls
-`startSlowQueryScanner()` from `src/lib/slow-query-scanner.ts`), which
-requires `experimental.instrumentationHook: true` in `next.config.mjs` on
-this project's Next.js version — already set, nothing extra to configure.
+120000ms) for any query that's been running long enough to count as
+"long-running" — 30 minutes by default — no external cron, no separate
+worker process, and it keeps running whether or not anyone has the app
+open in a browser. It's implemented as a Next.js `instrumentation.ts` hook
+(`src/instrumentation.ts` calls `startSlowQueryScanner()` from
+`src/lib/slow-query-scanner.ts`), which requires
+`experimental.instrumentationHook: true` in `next.config.mjs` on this
+project's Next.js version — already set, nothing extra to configure.
 
-**For quick end-to-end testing** (rather than waiting 30 real minutes),
-lower both of those in `.env` — e.g. `SLOW_QUERY_SCAN_INTERVAL_MS=30000`
-(scan every 30s) and `SLOW_QUERY_MIN_DURATION_SECONDS=300` (5-minute
-floor) — then restart the container (no rebuild needed, these are read at
-runtime). A query caught this way still shows up labeled "Warning (30–60
-min)" — that's the tier label, not literally how long it ran; the real
-duration is always shown next to it. Remove both (or set them back to
-their defaults) once you're done testing, so production behaves as
-documented above.
+**The 30-minute floor is a setting inside the app, not an environment
+variable.** From **DB Machines**, the "Query History settings" card at the
+top lets you type in a new value (in minutes) and save — the very next
+scan (within `SLOW_QUERY_SCAN_INTERVAL_MS`, ~2 minutes by default) picks it
+up automatically. No `.env` edit, no restart, no rebuild. This is stored in
+the app's own database (`AppSettings` table, see `src/lib/app-settings.ts`)
+rather than baked in at container start, specifically so it can be tuned
+live — e.g. temporarily lowering it to a few minutes for end-to-end testing,
+then raising it back to 30 once you've confirmed things work, all from the
+UI. `SLOW_QUERY_MIN_DURATION_SECONDS` in `.env` still exists, but only as
+the *starting* value the very first time the app runs with this feature —
+once anyone saves a value from the settings card, the env var is ignored
+from then on. A query caught below the real 30-minute mark still shows up
+labeled "Warning (30–60 min)" — that's the tier label, not literally how
+long it ran; the real duration is always shown next to it.
 
 Every entry shows the actual elapsed time (e.g. "1 hr 24 min"), not just a
 severity badge, and falls into one of four severity tiers based on how long

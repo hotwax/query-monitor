@@ -21,6 +21,7 @@ interface FiltersResponse {
   machines: { id: string; name: string }[];
   databases: string[];
   categories: { value: string; label: string }[];
+  minDurationSeconds: number;
 }
 
 const CATEGORY_COLOR: Record<string, string> = {
@@ -49,7 +50,12 @@ export default function QueryHistory() {
   const [exporting, setExporting] = useState(false);
   const [expanded, setExpanded] = useState<string | null>(null);
 
-  const [filterOptions, setFilterOptions] = useState<FiltersResponse>({ machines: [], databases: [], categories: [] });
+  const [filterOptions, setFilterOptions] = useState<FiltersResponse>({
+    machines: [],
+    databases: [],
+    categories: [],
+    minDurationSeconds: 30 * 60,
+  });
   const [connectionId, setConnectionId] = useState("");
   const [databaseName, setDatabaseName] = useState("");
   const [category, setCategory] = useState("");
@@ -149,9 +155,9 @@ export default function QueryHistory() {
             Query History
           </p>
           <p className="muted" style={{ fontSize: 13, margin: "4px 0 0", maxWidth: 640 }}>
-            A permanent record of every query that ran 30 minutes or longer, on any machine with
-            tracking turned on (see DB Machines to enable it per machine). Kept for 30 days, then
-            removed automatically.
+            A permanent record of every query that ran {formatDuration(filterOptions.minDurationSeconds)}{" "}
+            or longer, on any machine with tracking turned on (see DB Machines to enable it per
+            machine, and to change that floor). Kept for 30 days, then removed automatically.
           </p>
         </div>
         <button onClick={exportXlsx} disabled={exporting || loading}>
@@ -216,7 +222,9 @@ export default function QueryHistory() {
         <p className="muted">
           {hasFilters
             ? "No slow queries match these filters."
-            : "Nothing recorded yet — either no query has run past 30 minutes, or no machine has tracking turned on yet (see DB Machines)."}
+            : `Nothing recorded yet — either no query has run past ${formatDuration(
+                filterOptions.minDurationSeconds
+              )}, or no machine has tracking turned on yet (see DB Machines).`}
         </p>
       ) : (
         <>

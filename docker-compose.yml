@@ -38,8 +38,13 @@ services:
       QUERY_POLL_INTERVAL_MS: "${QUERY_POLL_INTERVAL_MS:-5000}"
       LONG_QUERY_THRESHOLD_SECONDS: "${LONG_QUERY_THRESHOLD_SECONDS:-5}"
       # Query History background scanner (see README "Query History") —
-      # all three optional, sensible defaults if unset.
+      # all optional, sensible defaults if unset.
       SLOW_QUERY_SCAN_INTERVAL_MS: "${SLOW_QUERY_SCAN_INTERVAL_MS:-120000}"
+      # Only used as the STARTING value the very first time this app runs —
+      # the actual floor now lives in the database and is edited from the
+      # DB Machines page ("Query History settings"), so it can be changed
+      # without touching this file or restarting anything. Once anyone
+      # saves a value from that page, this env var is ignored from then on.
       SLOW_QUERY_MIN_DURATION_SECONDS: "${SLOW_QUERY_MIN_DURATION_SECONDS:-1800}"
       SLOW_QUERY_RETENTION_DAYS: "${SLOW_QUERY_RETENTION_DAYS:-30}"
     depends_on:

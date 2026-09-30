@@ -1,0 +1,538 @@
+diff --git a/prisma/migrations/20260929114029_add_app_settings/migration.sql b/prisma/migrations/20260929114029_add_app_settings/migration.sql
+new file mode 100644
+index 0000000..7332a20
+--- /dev/null
++++ b/prisma/migrations/20260929114029_add_app_settings/migration.sql
+@@ -0,0 +1,8 @@
++-- CreateTable
++CREATE TABLE "AppSettings" (
++    "id" TEXT NOT NULL DEFAULT 'global',
++    "slowQueryMinDurationSeconds" INTEGER NOT NULL DEFAULT 1800,
++    "updatedAt" TIMESTAMP(3) NOT NULL,
++
++    CONSTRAINT "AppSettings_pkey" PRIMARY KEY ("id")
++);
+diff --git a/prisma/schema.prisma b/prisma/schema.prisma
+index b9f9345..8851b41 100644
+--- a/prisma/schema.prisma
++++ b/prisma/schema.prisma
+@@ -152,6 +152,29 @@ model DbConnection {
+   slowQueryLogs SlowQueryLog[]
+ }
+ 
++/// A single row of app-wide settings editable from within the app itself —
++/// deliberately NOT environment variables, so an admin can change one from
++/// the "DB Machines" page and have it take effect on the very next
++/// background scan, with no .env edit and no container restart/recreate
++/// required. Always exactly one row, at the fixed id "global" (see
++/// src/lib/app-settings.ts, which is the only code that should read/write
++/// this table — everything else goes through its helpers).
++model AppSettings {
++  id String @id @default("global")
++
++  /// Floor (in seconds) for the Query History log (see
++  /// src/lib/slow-query-scanner.ts) — a query has to run at least this long
++  /// before it's recorded at all. Editable from DB Machines > Query History
++  /// settings. Defaults to 30 minutes, matching the original hardcoded
++  /// behavior before this became configurable; on upgrade, an existing
++  /// SLOW_QUERY_MIN_DURATION_SECONDS env var is still honored as the
++  /// starting value until the first time someone saves a new value here
++  /// (see getSlowQueryMinDurationSeconds).
++  slowQueryMinDurationSeconds Int @default(1800)
++
++  updatedAt DateTime @updatedAt
++}
++
+ /// A permanent record of one query that ran past 30 minutes, kept for 30
+ /// days regardless of whether anyone had the app open when it happened —
+ /// see src/lib/slow-query-scanner.ts, which checks every registered
+diff --git a/src/app/api/settings/query-history/route.ts b/src/app/api/settings/query-history/route.ts
+new file mode 100644
+index 0000000..e3fa01c
+--- /dev/null
++++ b/src/app/api/settings/query-history/route.ts
+@@ -0,0 +1,53 @@
++import { NextRequest, NextResponse } from "next/server";
++import { getSession } from "@/lib/session";
++import { logAudit } from "@/lib/audit";
++import { roleAllows, CAN_MANAGE_CONNECTIONS } from "@/lib/rbac";
++import { getSlowQueryMinDurationSeconds, setSlowQueryMinDurationSeconds } from "@/lib/app-settings";
++
++// Anyone signed in can see the current floor (the Query History page shows
++// it in its description), but only DEVOPS/ADMIN — same bar as everything
++// else on the DB Machines page — can change it.
++export async function GET() {
++  const session = await getSession();
++  if (!session) return NextResponse.json({ error: "Not authenticated" }, { status: 401 });
++
++  const slowQueryMinDurationSeconds = await getSlowQueryMinDurationSeconds();
++  return NextResponse.json({ slowQueryMinDurationSeconds });
++}
++
++export async function PATCH(req: NextRequest) {
++  const session = await getSession();
++  if (!session || !roleAllows(session.role, CAN_MANAGE_CONNECTIONS)) {
++    return NextResponse.json({ error: "Forbidden" }, { status: 403 });
++  }
++
++  const body = await req.json().catch(() => null);
++  const raw = body?.slowQueryMinDurationSeconds;
++  const seconds = Number(raw);
++
++  // Sanity bounds: 0 would record literally every query ever seen (never
++  // useful — that's what the live Dashboard is for), and an absurdly large
++  // value is almost certainly a unit mistake (e.g. minutes typed into a
++  // seconds field). Generous on both ends since this is an internal tool,
++  // but not unbounded.
++  if (!Number.isFinite(seconds) || seconds < 10 || seconds > 24 * 60 * 60) {
++    return NextResponse.json(
++      { error: "slowQueryMinDurationSeconds must be a number of seconds between 10 and 86400 (24 hours)." },
++      { status: 400 }
++    );
++  }
++
++  const before = await getSlowQueryMinDurationSeconds();
++  const saved = await setSlowQueryMinDurationSeconds(Math.round(seconds));
++
++  if (before !== saved) {
++    await logAudit({
++      actorEmail: session.email,
++      actorId: session.sub,
++      action: "SLOW_QUERY_MIN_DURATION_CHANGED",
++      detail: { fromSeconds: before, toSeconds: saved },
++    });
++  }
++
++  return NextResponse.json({ slowQueryMinDurationSeconds: saved });
++}
+diff --git a/src/app/api/slow-queries/filters/route.ts b/src/app/api/slow-queries/filters/route.ts
+index 9a16816..7660c3e 100644
+--- a/src/app/api/slow-queries/filters/route.ts
++++ b/src/app/api/slow-queries/filters/route.ts
+@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
+ import { prisma } from "@/lib/db";
+ import { getSession } from "@/lib/session";
+ import { DURATION_CATEGORIES } from "@/lib/slow-query-categories";
++import { getSlowQueryMinDurationSeconds } from "@/lib/app-settings";
+ 
+ /**
+  * Populates the Query History page's filter dropdowns: every DB Machine
+@@ -15,7 +16,7 @@ export async function GET() {
+   const session = await getSession();
+   if (!session) return NextResponse.json({ error: "Not authenticated" }, { status: 401 });
+ 
+-  const [machines, loggedConnectionNames, databaseRows] = await Promise.all([
++  const [machines, loggedConnectionNames, databaseRows, minDurationSeconds] = await Promise.all([
+     prisma.dbConnection.findMany({
+       where: { slowQueryTrackingEnabled: true },
+       select: { id: true, name: true },
+@@ -31,6 +32,7 @@ export async function GET() {
+       where: { databaseName: { not: null } },
+       orderBy: { databaseName: "asc" },
+     }),
++    getSlowQueryMinDurationSeconds(),
+   ]);
+ 
+   // Merge in machines that have history but aren't (or are no longer)
+@@ -49,5 +51,8 @@ export async function GET() {
+     machines: allMachines,
+     databases: databaseRows.map((r) => r.databaseName).filter((d): d is string => Boolean(d)),
+     categories: DURATION_CATEGORIES.map((c) => ({ value: c.value, label: c.label })),
++    // So the page can describe the floor accurately instead of a hardcoded
++    // "30 minutes" — this is now an admin-editable setting, see DB Machines.
++    minDurationSeconds,
+   });
+ }
+diff --git a/src/components/ConnectionsAdmin.tsx b/src/components/ConnectionsAdmin.tsx
+index 5c1518c..e3e429a 100644
+--- a/src/components/ConnectionsAdmin.tsx
++++ b/src/components/ConnectionsAdmin.tsx
+@@ -43,15 +43,62 @@ export default function ConnectionsAdmin() {
+   const [awsEditForm, setAwsEditForm] = useState({ awsDbInstanceIdentifier: "", isReadReplica: false, awsRegion: "" });
+   const [togglingTrackingId, setTogglingTrackingId] = useState<string | null>(null);
+ 
++  // "Minimum duration to track" (Query History floor) — a single app-wide
++  // setting stored in the database (see src/lib/app-settings.ts), edited
++  // here as whole minutes for readability even though it's stored/consumed
++  // in seconds everywhere else.
++  const [minDurationMinutes, setMinDurationMinutes] = useState<string>("30");
++  const [minDurationSaving, setMinDurationSaving] = useState(false);
++  const [minDurationError, setMinDurationError] = useState<string | null>(null);
++  const [minDurationSaved, setMinDurationSaved] = useState(false);
++
+   const load = useCallback(async () => {
+     const res = await fetch("/api/connections");
+     const data = await res.json();
+     setConnections(data.connections ?? []);
+   }, []);
+ 
++  const loadMinDuration = useCallback(async () => {
++    const res = await fetch("/api/settings/query-history");
++    if (!res.ok) return;
++    const data = await res.json();
++    if (typeof data.slowQueryMinDurationSeconds === "number") {
++      setMinDurationMinutes(String(Math.round(data.slowQueryMinDurationSeconds / 60)));
++    }
++  }, []);
++
+   useEffect(() => {
+     load();
+-  }, [load]);
++    loadMinDuration();
++  }, [load, loadMinDuration]);
++
++  async function saveMinDuration(e: React.FormEvent) {
++    e.preventDefault();
++    setMinDurationSaving(true);
++    setMinDurationError(null);
++    setMinDurationSaved(false);
++    try {
++      const minutes = Number(minDurationMinutes);
++      if (!Number.isFinite(minutes) || minutes <= 0) {
++        setMinDurationError("Enter a whole number of minutes greater than 0.");
++        return;
++      }
++      const res = await fetch("/api/settings/query-history", {
++        method: "PATCH",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({ slowQueryMinDurationSeconds: Math.round(minutes * 60) }),
++      });
++      const data = await res.json();
++      if (!res.ok) {
++        setMinDurationError(data.error ?? "Could not save.");
++        return;
++      }
++      setMinDurationMinutes(String(Math.round(data.slowQueryMinDurationSeconds / 60)));
++      setMinDurationSaved(true);
++    } finally {
++      setMinDurationSaving(false);
++    }
++  }
+ 
+   async function submit(e: React.FormEvent) {
+     e.preventDefault();
+@@ -115,7 +162,41 @@ export default function ConnectionsAdmin() {
+   }
+ 
+   return (
+-    <div style={{ display: "grid", gridTemplateColumns: "1fr 420px", gap: 20 }}>
++    <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
++      <div className="card">
++        <p className="section-title">Query History settings</p>
++        <p className="muted" style={{ fontSize: 12, marginTop: -6, marginBottom: 12, maxWidth: 640 }}>
++          How long a query has to run before it&apos;s recorded permanently in Query History (see
++          the Query History nav page). Applies to every machine with tracking turned on below.
++          Saving here takes effect on the very next background scan — no restart needed.
++        </p>
++        {minDurationError && <div className="alert error">{minDurationError}</div>}
++        <form onSubmit={saveMinDuration} style={{ display: "flex", gap: 10, alignItems: "flex-end", flexWrap: "wrap" }}>
++          <div className="field" style={{ margin: 0 }}>
++            <label>Minimum duration to track (minutes)</label>
++            <input
++              type="number"
++              min={1}
++              value={minDurationMinutes}
++              onChange={(e) => {
++                setMinDurationMinutes(e.target.value);
++                setMinDurationSaved(false);
++              }}
++              style={{ width: 140 }}
++            />
++          </div>
++          <button type="submit" disabled={minDurationSaving}>
++            {minDurationSaving ? "Saving…" : "Save"}
++          </button>
++          {minDurationSaved && !minDurationSaving && (
++            <span className="muted" style={{ fontSize: 12 }}>
++              Saved — the scanner will use this from its next cycle.
++            </span>
++          )}
++        </form>
++      </div>
++
++      <div style={{ display: "grid", gridTemplateColumns: "1fr 420px", gap: 20 }}>
+       <div className="card">
+         <p className="section-title">Registered database machines</p>
+         <p className="muted" style={{ fontSize: 12, marginTop: -6, marginBottom: 12 }}>
+@@ -410,6 +491,7 @@ export default function ConnectionsAdmin() {
+           </button>
+         </form>
+       </div>
++      </div>
+     </div>
+   );
+ }
+diff --git a/src/components/QueryHistory.tsx b/src/components/QueryHistory.tsx
+index 79a7549..5038994 100644
+--- a/src/components/QueryHistory.tsx
++++ b/src/components/QueryHistory.tsx
+@@ -21,6 +21,7 @@ interface FiltersResponse {
+   machines: { id: string; name: string }[];
+   databases: string[];
+   categories: { value: string; label: string }[];
++  minDurationSeconds: number;
+ }
+ 
+ const CATEGORY_COLOR: Record<string, string> = {
+@@ -49,7 +50,12 @@ export default function QueryHistory() {
+   const [exporting, setExporting] = useState(false);
+   const [expanded, setExpanded] = useState<string | null>(null);
+ 
+-  const [filterOptions, setFilterOptions] = useState<FiltersResponse>({ machines: [], databases: [], categories: [] });
++  const [filterOptions, setFilterOptions] = useState<FiltersResponse>({
++    machines: [],
++    databases: [],
++    categories: [],
++    minDurationSeconds: 30 * 60,
++  });
+   const [connectionId, setConnectionId] = useState("");
+   const [databaseName, setDatabaseName] = useState("");
+   const [category, setCategory] = useState("");
+@@ -149,9 +155,9 @@ export default function QueryHistory() {
+             Query History
+           </p>
+           <p className="muted" style={{ fontSize: 13, margin: "4px 0 0", maxWidth: 640 }}>
+-            A permanent record of every query that ran 30 minutes or longer, on any machine with
+-            tracking turned on (see DB Machines to enable it per machine). Kept for 30 days, then
+-            removed automatically.
++            A permanent record of every query that ran {formatDuration(filterOptions.minDurationSeconds)}{" "}
++            or longer, on any machine with tracking turned on (see DB Machines to enable it per
++            machine, and to change that floor). Kept for 30 days, then removed automatically.
+           </p>
+         </div>
+         <button onClick={exportXlsx} disabled={exporting || loading}>
+@@ -216,7 +222,9 @@ export default function QueryHistory() {
+         <p className="muted">
+           {hasFilters
+             ? "No slow queries match these filters."
+-            : "Nothing recorded yet — either no query has run past 30 minutes, or no machine has tracking turned on yet (see DB Machines)."}
++            : `Nothing recorded yet — either no query has run past ${formatDuration(
++                filterOptions.minDurationSeconds
++              )}, or no machine has tracking turned on yet (see DB Machines).`}
+         </p>
+       ) : (
+         <>
+diff --git a/src/lib/app-settings.ts b/src/lib/app-settings.ts
+new file mode 100644
+index 0000000..b0f8e30
+--- /dev/null
++++ b/src/lib/app-settings.ts
+@@ -0,0 +1,51 @@
++import { prisma } from "@/lib/db";
++
++/**
++ * App-wide settings that live in the database instead of environment
++ * variables — the whole point being that they can be changed from inside
++ * the app itself (see the "Query History settings" card on the DB Machines
++ * page) without editing .env or restarting/recreating the container. This
++ * is the ONLY module that should touch the AppSettings table directly —
++ * everything else calls these helpers.
++ *
++ * There is always exactly one row, at a fixed id ("global"). Reads that
++ * find no row yet (a brand-new install, or an existing one that's never
++ * saved a value through the UI) fall back to whatever
++ * SLOW_QUERY_MIN_DURATION_SECONDS was set to in the environment — so
++ * upgrading this app doesn't silently reset an already-tuned threshold
++ * back to the 30-minute default the moment this ships. The first time
++ * anyone saves a new value from the UI, a real row is created and the env
++ * var stops being consulted from then on.
++ */
++
++const SETTINGS_ID = "global";
++const DEFAULT_SLOW_QUERY_MIN_DURATION_SECONDS = 30 * 60;
++
++function envFallbackMinDurationSeconds(): number {
++  const raw = process.env.SLOW_QUERY_MIN_DURATION_SECONDS;
++  const parsed = raw ? Number(raw) : NaN;
++  return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_SLOW_QUERY_MIN_DURATION_SECONDS;
++}
++
++/**
++ * The current Query History floor, in seconds — read fresh from the
++ * database on every call (the background scanner calls this once per scan
++ * cycle, see src/lib/slow-query-scanner.ts), so a change saved from the UI
++ * takes effect within one scan interval rather than needing a restart.
++ */
++export async function getSlowQueryMinDurationSeconds(): Promise<number> {
++  const row = await prisma.appSettings.findUnique({
++    where: { id: SETTINGS_ID },
++    select: { slowQueryMinDurationSeconds: true },
++  });
++  return row?.slowQueryMinDurationSeconds ?? envFallbackMinDurationSeconds();
++}
++
++export async function setSlowQueryMinDurationSeconds(seconds: number): Promise<number> {
++  const row = await prisma.appSettings.upsert({
++    where: { id: SETTINGS_ID },
++    update: { slowQueryMinDurationSeconds: seconds },
++    create: { id: SETTINGS_ID, slowQueryMinDurationSeconds: seconds },
++  });
++  return row.slowQueryMinDurationSeconds;
++}
+diff --git a/src/lib/audit.ts b/src/lib/audit.ts
+index 78be6b1..bc892a2 100644
+--- a/src/lib/audit.ts
++++ b/src/lib/audit.ts
+@@ -39,7 +39,10 @@ export async function logAudit(params: {
+     // Slow query history (see /query-history and src/lib/slow-query-scanner.ts):
+     | "SLOW_QUERY_TRACKING_ENABLED"
+     | "SLOW_QUERY_TRACKING_DISABLED"
+-    | "SLOW_QUERY_HISTORY_EXPORTED";
++    | "SLOW_QUERY_HISTORY_EXPORTED"
++    // The global "how long before it counts as long-running" floor — see
++    // src/lib/app-settings.ts and the DB Machines page's settings card:
++    | "SLOW_QUERY_MIN_DURATION_CHANGED";
+   connectionId?: string;
+   detail?: Record<string, unknown>;
+ }) {
+diff --git a/src/lib/slow-query-scanner.ts b/src/lib/slow-query-scanner.ts
+index 50b7682..756c6b6 100644
+--- a/src/lib/slow-query-scanner.ts
++++ b/src/lib/slow-query-scanner.ts
+@@ -1,6 +1,7 @@
+ import { prisma } from "@/lib/db";
+ import { collectLongRunningQueriesOnly } from "@/lib/mysql-collector";
+-import { categorizeDuration, MIN_TRACKED_DURATION_SECONDS } from "@/lib/slow-query-categories";
++import { categorizeDuration } from "@/lib/slow-query-categories";
++import { getSlowQueryMinDurationSeconds } from "@/lib/app-settings";
+ 
+ /**
+  * Background recorder for the "Query History" page. Runs entirely inside
+@@ -86,10 +87,10 @@ async function recordOccurrence(connection: TrackedConnection, q: Awaited<Return
+   });
+ }
+ 
+-async function scanConnection(connection: TrackedConnection) {
++async function scanConnection(connection: TrackedConnection, minDurationSeconds: number) {
+   let queries;
+   try {
+-    queries = await collectLongRunningQueriesOnly(connection, MIN_TRACKED_DURATION_SECONDS);
++    queries = await collectLongRunningQueriesOnly(connection, minDurationSeconds);
+   } catch (err) {
+     // Fail open — one unreachable machine shouldn't stop the others, and
+     // we'll just try this one again on the next tick.
+@@ -132,12 +133,18 @@ async function tick() {
+   if (isTicking) return; // a previous tick is still running (slow/unreachable machine) — skip, try again next interval
+   isTicking = true;
+   try {
+-    const connections = await prisma.dbConnection.findMany({
+-      where: { slowQueryTrackingEnabled: true },
+-      select: { id: true, name: true, host: true, port: true, monitorUsername: true, monitorPasswordEnc: true },
+-    });
+-
+-    await Promise.allSettled(connections.map((c) => scanConnection(c)));
++    // Read fresh every tick (not once at startup) — this is what lets a
++    // value saved from the "Query History settings" UI take effect on the
++    // very next scan, rather than needing a restart the way an env var did.
++    const [connections, minDurationSeconds] = await Promise.all([
++      prisma.dbConnection.findMany({
++        where: { slowQueryTrackingEnabled: true },
++        select: { id: true, name: true, host: true, port: true, monitorUsername: true, monitorPasswordEnc: true },
++      }),
++      getSlowQueryMinDurationSeconds(),
++    ]);
++
++    await Promise.allSettled(connections.map((c) => scanConnection(c, minDurationSeconds)));
+ 
+     const now = Date.now();
+     if (now - lastCleanupAt > CLEANUP_INTERVAL_MS) {
+--- a/README.md
++++ b/README.md
+@@ -294,24 +294,30 @@
+ 
+ Once on for a machine, a background job built into the app itself checks
+ that machine every ~2 minutes (`SLOW_QUERY_SCAN_INTERVAL_MS`, default
+-120000ms) for any query that's been running 30 minutes or more
+-(`SLOW_QUERY_MIN_DURATION_SECONDS`, default 1800) — no external cron, no
+-separate worker process, and it keeps running whether or not anyone has
+-the app open in a browser. It's implemented as a Next.js
+-`instrumentation.ts` hook (`src/instrumentation.ts` calls
+-`startSlowQueryScanner()` from `src/lib/slow-query-scanner.ts`), which
+-requires `experimental.instrumentationHook: true` in `next.config.mjs` on
+-this project's Next.js version — already set, nothing extra to configure.
++120000ms) for any query that's been running long enough to count as
++"long-running" — 30 minutes by default — no external cron, no separate
++worker process, and it keeps running whether or not anyone has the app
++open in a browser. It's implemented as a Next.js `instrumentation.ts` hook
++(`src/instrumentation.ts` calls `startSlowQueryScanner()` from
++`src/lib/slow-query-scanner.ts`), which requires
++`experimental.instrumentationHook: true` in `next.config.mjs` on this
++project's Next.js version — already set, nothing extra to configure.
+ 
+-**For quick end-to-end testing** (rather than waiting 30 real minutes),
+-lower both of those in `.env` — e.g. `SLOW_QUERY_SCAN_INTERVAL_MS=30000`
+-(scan every 30s) and `SLOW_QUERY_MIN_DURATION_SECONDS=300` (5-minute
+-floor) — then restart the container (no rebuild needed, these are read at
+-runtime). A query caught this way still shows up labeled "Warning (30–60
+-min)" — that's the tier label, not literally how long it ran; the real
+-duration is always shown next to it. Remove both (or set them back to
+-their defaults) once you're done testing, so production behaves as
+-documented above.
++**The 30-minute floor is a setting inside the app, not an environment
++variable.** From **DB Machines**, the "Query History settings" card at the
++top lets you type in a new value (in minutes) and save — the very next
++scan (within `SLOW_QUERY_SCAN_INTERVAL_MS`, ~2 minutes by default) picks it
++up automatically. No `.env` edit, no restart, no rebuild. This is stored in
++the app's own database (`AppSettings` table, see `src/lib/app-settings.ts`)
++rather than baked in at container start, specifically so it can be tuned
++live — e.g. temporarily lowering it to a few minutes for end-to-end testing,
++then raising it back to 30 once you've confirmed things work, all from the
++UI. `SLOW_QUERY_MIN_DURATION_SECONDS` in `.env` still exists, but only as
++the *starting* value the very first time the app runs with this feature —
++once anyone saves a value from the settings card, the env var is ignored
++from then on. A query caught below the real 30-minute mark still shows up
++labeled "Warning (30–60 min)" — that's the tier label, not literally how
++long it ran; the real duration is always shown next to it.
+ 
+ Every entry shows the actual elapsed time (e.g. "1 hr 24 min"), not just a
+ severity badge, and falls into one of four severity tiers based on how long
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -38,8 +38,13 @@
+       QUERY_POLL_INTERVAL_MS: "${QUERY_POLL_INTERVAL_MS:-5000}"
+       LONG_QUERY_THRESHOLD_SECONDS: "${LONG_QUERY_THRESHOLD_SECONDS:-5}"
+       # Query History background scanner (see README "Query History") —
+-      # all three optional, sensible defaults if unset.
++      # all optional, sensible defaults if unset.
+       SLOW_QUERY_SCAN_INTERVAL_MS: "${SLOW_QUERY_SCAN_INTERVAL_MS:-120000}"
++      # Only used as the STARTING value the very first time this app runs —
++      # the actual floor now lives in the database and is edited from the
++      # DB Machines page ("Query History settings"), so it can be changed
++      # without touching this file or restarting anything. Once anyone
++      # saves a value from that page, this env var is ignored from then on.
+       SLOW_QUERY_MIN_DURATION_SECONDS: "${SLOW_QUERY_MIN_DURATION_SECONDS:-1800}"
+       SLOW_QUERY_RETENTION_DAYS: "${SLOW_QUERY_RETENTION_DAYS:-30}"
+     depends_on:
+--- a/src/lib/slow-query-categories.ts
++++ b/src/lib/slow-query-categories.ts
+@@ -16,19 +16,17 @@
+   { value: "SEVERE", label: "Severe (3 hr+)", minMinutes: 180, maxMinutes: null },
+ ];
+ 
+-/**
+- * The lowest duration (in seconds) this log tracks at all — anything under
+- * this is never recorded. 30 minutes by default (matching the agreed
+- * "Warning" tier's floor); override with SLOW_QUERY_MIN_DURATION_SECONDS
+- * for quicker end-to-end testing (e.g. 300 for a 5-minute floor) without a
+- * code change or rebuild — just set it in .env and restart the container.
+- * Note that lowering it doesn't change the severity tiers themselves: a
+- * query caught below the real 30-minute mark still shows up labeled
+- * "Warning (30–60 min)" (the lowest tier categorizeDuration has), since
+- * that label describes the tier, not literally how long this one query
+- * ran — its actual duration is always shown alongside it regardless.
+- */
+-export const MIN_TRACKED_DURATION_SECONDS = Number(process.env.SLOW_QUERY_MIN_DURATION_SECONDS ?? 30 * 60);
++// The lowest duration this log tracks at all used to live here as a fixed,
++// env-var-backed constant. It's now a database-backed, admin-editable
++// setting instead — see getSlowQueryMinDurationSeconds in
++// src/lib/app-settings.ts (and the "Query History settings" card on the DB
++// Machines page) — so it can be changed from inside the app itself, with no
++// .env edit or restart needed. Note that lowering it doesn't change the
++// severity tiers themselves: a query caught below the real 30-minute mark
++// still shows up labeled "Warning (30–60 min)" (the lowest tier
++// categorizeDuration has), since that label describes the tier, not
++// literally how long this one query ran — its actual duration is always
++// shown alongside it regardless.
+ 
+ export function isDurationCategory(value: string): value is DurationCategory {
+   return DURATION_CATEGORIES.some((c) => c.value === value);

@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/db";
 import { getSession } from "@/lib/session";
 import { DURATION_CATEGORIES } from "@/lib/slow-query-categories";
+import { getSlowQueryMinDurationSeconds } from "@/lib/app-settings";
 
 /**
  * Populates the Query History page's filter dropdowns: every DB Machine
@@ -15,7 +16,7 @@ export async function GET() {
   const session = await getSession();
   if (!session) return NextResponse.json({ error: "Not authenticated" }, { status: 401 });
 
-  const [machines, loggedConnectionNames, databaseRows] = await Promise.all([
+  const [machines, loggedConnectionNames, databaseRows, minDurationSeconds] = await Promise.all([
     prisma.dbConnection.findMany({
       where: { slowQueryTrackingEnabled: true },
       select: { id: true, name: true },
@@ -31,6 +32,7 @@ export async function GET() {
       where: { databaseName: { not: null } },
       orderBy: { databaseName: "asc" },
     }),
+    getSlowQueryMinDurationSeconds(),
   ]);
 
   // Merge in machines that have history but aren't (or are no longer)
@@ -49,5 +51,8 @@ export async function GET() {
     machines: allMachines,
     databases: databaseRows.map((r) => r.databaseName).filter((d): d is string => Boolean(d)),
     categories: DURATION_CATEGORIES.map((c) => ({ value: c.value, label: c.label })),
+    // So the page can describe the floor accurately instead of a hardcoded
+    // "30 minutes" — this is now an admin-editable setting, see DB Machines.
+    minDurationSeconds,
   });
 }

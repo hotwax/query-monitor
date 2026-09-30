@@ -152,6 +152,29 @@ model DbConnection {
   slowQueryLogs SlowQueryLog[]
 }
 
+/// A single row of app-wide settings editable from within the app itself —
+/// deliberately NOT environment variables, so an admin can change one from
+/// the "DB Machines" page and have it take effect on the very next
+/// background scan, with no .env edit and no container restart/recreate
+/// required. Always exactly one row, at the fixed id "global" (see
+/// src/lib/app-settings.ts, which is the only code that should read/write
+/// this table — everything else goes through its helpers).
+model AppSettings {
+  id String @id @default("global")
+
+  /// Floor (in seconds) for the Query History log (see
+  /// src/lib/slow-query-scanner.ts) — a query has to run at least this long
+  /// before it's recorded at all. Editable from DB Machines > Query History
+  /// settings. Defaults to 30 minutes, matching the original hardcoded
+  /// behavior before this became configurable; on upgrade, an existing
+  /// SLOW_QUERY_MIN_DURATION_SECONDS env var is still honored as the
+  /// starting value until the first time someone saves a new value here
+  /// (see getSlowQueryMinDurationSeconds).
+  slowQueryMinDurationSeconds Int @default(1800)
+
+  updatedAt DateTime @updatedAt
+}
+
 /// A permanent record of one query that ran past 30 minutes, kept for 30
 /// days regardless of whether anyone had the app open when it happened —
 /// see src/lib/slow-query-scanner.ts, which checks every registered
