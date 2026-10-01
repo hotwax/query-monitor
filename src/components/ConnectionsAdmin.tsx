@@ -196,7 +196,7 @@ export default function ConnectionsAdmin() {
         </form>
       </div>
 
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 420px", gap: 20 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 420px", gap: 20, alignItems: "start" }}>
       <div className="card">
         <p className="section-title">Registered database machines</p>
         <p className="muted" style={{ fontSize: 12, marginTop: -6, marginBottom: 12 }}>
@@ -337,9 +337,7 @@ export default function ConnectionsAdmin() {
               style={{ width: "100%" }}
             />
             <p className="muted" style={{ fontSize: 12, marginTop: 4 }}>
-              The host THIS APP uses to connect. For local Docker testing against a database on
-              your own machine, that&apos;s usually <code>host.docker.internal</code>, not{" "}
-              <code>127.0.0.1</code> or <code>localhost</code> — see the field below.
+              The host this app connects to (use <code>host.docker.internal</code> for local Docker testing).
             </p>
           </div>
           <div className="field">
@@ -359,12 +357,7 @@ export default function ConnectionsAdmin() {
               style={{ width: "100%" }}
             />
             <p className="muted" style={{ fontSize: 12, marginTop: 4 }}>
-              By default every machine is polled with the shared read-only user you created
-              yourself and passed in via the <code>MONITOR_DB_USERNAME</code> /{" "}
-              <code>MONITOR_DB_PASSWORD</code> environment variables (see
-              prisma/rds-readonly-user.sql for the grants that user needs — PROCESS +
-              performance_schema SELECT only, no data or write access). Only fill these two
-              fields in if this specific machine needs a different read-only user.
+              Leave blank to use the shared <code>MONITOR_DB_USERNAME</code>/<code>PASSWORD</code>.
             </p>
           </div>
           <div className="field">
@@ -386,11 +379,7 @@ export default function ConnectionsAdmin() {
               style={{ width: "100%" }}
             />
             <p className="muted" style={{ fontSize: 12, marginTop: 4 }}>
-              By default every machine uses the shared, narrowly-scoped kill account you created
-              yourself via <code>KILL_DB_USERNAME</code> / <code>KILL_DB_PASSWORD</code> (see
-              prisma/rds-kill-user.sql — PROCESS + EXECUTE on the RDS kill procedures only, no
-              data access). Only fill these two fields in if this specific machine needs its own
-              kill account.
+              Leave blank to use the shared <code>KILL_DB_USERNAME</code>/<code>PASSWORD</code>.
             </p>
           </div>
           <div className="field">
@@ -414,11 +403,7 @@ export default function ConnectionsAdmin() {
               <option value="DIRECT_KILL">Direct KILL (self-managed MySQL/MariaDB with CONNECTION_ADMIN/SUPER)</option>
             </select>
             <p className="muted" style={{ fontSize: 12, marginTop: 4 }}>
-              AWS RDS/Aurora doesn&apos;t allow granting CONNECTION_ADMIN/SUPER to a regular user
-              on current engine versions, so on RDS the kill account instead uses the built-in{" "}
-              <code>mysql.rds_kill</code> / <code>mysql.rds_kill_query</code> procedures. Only pick
-              &quot;Direct KILL&quot; for a self-managed instance where you&apos;ve granted
-              CONNECTION_ADMIN or SUPER directly.
+              Use the default unless this is a self-managed instance with CONNECTION_ADMIN/SUPER granted directly.
             </p>
           </div>
           <div className="field">
@@ -430,11 +415,7 @@ export default function ConnectionsAdmin() {
               style={{ width: "100%" }}
             />
             <p className="muted" style={{ fontSize: 12, marginTop: 4 }}>
-              Left over from when Kill Query only ever printed a command for a human to copy into
-              their own terminal, and that terminal sometimes needed a different host name than the
-              app container did. Now that the app kills a query itself (server-side, after a typed
-              confirmation), only <strong>Host</strong> above matters — this field isn&apos;t read
-              anywhere. Safe to leave blank.
+              Not read anywhere — safe to leave blank.
             </p>
           </div>
           <div className="field">
@@ -454,9 +435,7 @@ export default function ConnectionsAdmin() {
               style={{ width: "100%" }}
             />
             <p className="muted" style={{ fontSize: 12, marginTop: 4 }}>
-              Enables this machine on the <strong>Monitoring</strong> page (CloudWatch graphs). This
-              is the RDS console&apos;s own instance identifier, not the hostname above — leave
-              blank and this machine just won&apos;t appear there; can be added later.
+              Enables this machine on the Monitoring page — leave blank to add later.
             </p>
           </div>
           <div className="field">
@@ -469,7 +448,7 @@ export default function ConnectionsAdmin() {
               This is a read replica
             </label>
             <p className="muted" style={{ fontSize: 12, marginTop: 4 }}>
-              Shows Replica Lag first on the Monitoring page for this machine.
+              Shows Replica Lag first on the Monitoring page.
             </p>
           </div>
           <div className="field">
@@ -481,9 +460,7 @@ export default function ConnectionsAdmin() {
               style={{ width: "100%" }}
             />
             <p className="muted" style={{ fontSize: 12, marginTop: 4 }}>
-              CloudWatch metrics are looked up per-region. Only set this if THIS machine is in a
-              different AWS region than your other machines (e.g. a UAT instance in a different
-              region than prod) — otherwise leave blank and it uses <code>AWS_REGION</code>.
+              Only needed if this machine is in a different region than the app-wide <code>AWS_REGION</code>.
             </p>
           </div>
           <button type="submit" disabled={saving} style={{ width: "100%" }}>

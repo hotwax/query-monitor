@@ -93,8 +93,8 @@ export default function KillLogAdmin() {
 
   return (
     <div className="card">
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", marginBottom: 16 }}>
-        <div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", gap: 24, flexWrap: "wrap", marginBottom: 16 }}>
+        <div style={{ maxWidth: 640 }}>
           <p className="section-title" style={{ margin: 0 }}>
             Kill Log
           </p>

@@ -92,6 +92,41 @@ function killHref(params: {
   return `/dashboard/kill/${params.connectionId}/${params.processId}?${q.toString()}`;
 }
 
+type SortKey = "duration" | "database" | "dbUser" | "clientHost";
+type SortDir = "asc" | "desc";
+
+function sortQueries(queries: RunningQuery[], key: SortKey, dir: SortDir): RunningQuery[] {
+  const sign = dir === "asc" ? 1 : -1;
+  return [...queries].sort((a, b) => {
+    if (key === "duration") return (a.durationSeconds - b.durationSeconds) * sign;
+    if (key === "database") return (a.database ?? "").localeCompare(b.database ?? "") * sign;
+    if (key === "dbUser") return a.dbUsername.localeCompare(b.dbUsername) * sign;
+    return (a.clientHost ?? "").localeCompare(b.clientHost ?? "") * sign;
+  });
+}
+
+function SortableHeader({
+  label,
+  sortKey,
+  activeKey,
+  activeDir,
+  onSort,
+}: {
+  label: string;
+  sortKey: SortKey;
+  activeKey: SortKey;
+  activeDir: SortDir;
+  onSort: (key: SortKey) => void;
+}) {
+  const active = sortKey === activeKey;
+  return (
+    <th onClick={() => onSort(sortKey)} style={{ cursor: "pointer", userSelect: "none" }} title="Click to sort">
+      {label}
+      {active && <span style={{ marginLeft: 4 }}>{activeDir === "asc" ? "▲" : "▼"}</span>}
+    </th>
+  );
+}
+
 function QueryTable({
   queries,
   canKill,
@@ -101,25 +136,38 @@ function QueryTable({
   canKill: boolean;
   emptyMessage: string;
 }) {
+  const [sortKey, setSortKey] = useState<SortKey>("duration");
+  const [sortDir, setSortDir] = useState<SortDir>("desc");
+
+  function handleSort(key: SortKey) {
+    if (key === sortKey) {
+      setSortDir((d) => (d === "asc" ? "desc" : "asc"));
+    } else {
+      setSortKey(key);
+      setSortDir(key === "duration" ? "desc" : "asc");
+    }
+  }
+
   if (queries.length === 0) {
     return <p className="muted">{emptyMessage}</p>;
   }
+  const sorted = sortQueries(queries, sortKey, sortDir);
   return (
     <table>
       <thead>
         <tr>
-          <th>Duration</th>
+          <SortableHeader label="Duration" sortKey="duration" activeKey={sortKey} activeDir={sortDir} onSort={handleSort} />
           <th>Machine</th>
-          <th>Database</th>
-          <th>DB user</th>
-          <th>Client host</th>
+          <SortableHeader label="Database" sortKey="database" activeKey={sortKey} activeDir={sortDir} onSort={handleSort} />
+          <SortableHeader label="DB user" sortKey="dbUser" activeKey={sortKey} activeDir={sortDir} onSort={handleSort} />
+          <SortableHeader label="Client host" sortKey="clientHost" activeKey={sortKey} activeDir={sortDir} onSort={handleSort} />
           <th>State</th>
           <th>Query</th>
           {canKill && <th></th>}
         </tr>
       </thead>
       <tbody>
-        {queries.map((q) => (
+        {sorted.map((q) => (
           <tr key={`${q.connectionId}-${q.processId}`}>
             <td className={durationClass(q.durationSeconds)}>{formatDuration(q.durationSeconds)}</td>
             <td>{q.connectionName}</td>
@@ -157,7 +205,7 @@ function QueryTable({
 
 function LockWaitTable({ lockWaits, canKill }: { lockWaits: LockWait[]; canKill: boolean }) {
   if (lockWaits.length === 0) {
-    return <p className="muted">No blocked queries right now. 🎉</p>;
+    return <p className="muted">No blocked queries right now.</p>;
   }
   return (
     <table>
@@ -247,7 +295,7 @@ function LockWaitTable({ lockWaits, canKill }: { lockWaits: LockWait[]; canKill:
 
 export default function QueryDashboard({ role }: { role: Role }) {
   const [machines, setMachines] = useState<Machine[]>([]);
-  const [selected, setSelected] = useState<string>("all");
+  const [selected, setSelected] = useState<string>("");
   const [queries, setQueries] = useState<RunningQuery[]>([]);
   const [lockWaits, setLockWaits] = useState<LockWait[]>([]);
   const [threshold, setThreshold] = useState<number>(DEFAULT_THRESHOLD);
@@ -286,17 +334,23 @@ export default function QueryDashboard({ role }: { role: Role }) {
   useEffect(() => {
     fetch("/api/machines")
       .then((r) => r.json())
-      .then((d) => setMachines(d.connections ?? []));
+      .then((d) => {
+        const connections = d.connections ?? [];
+        setMachines(connections);
+        // No "All machines" option anymore — always land on a specific
+        // machine, defaulting to the first one registered.
+        setSelected((current) => current || connections[0]?.id || "");
+      });
   }, []);
 
   const refresh = useCallback(async () => {
+    if (!selected) return;
     setRefreshing(true);
     // minDuration=0: always fetch every currently-executing query (not just
     // ones already over the long-running threshold) — the dashboard splits
     // that one result set into the two sections below.
-    const base = selected === "all" ? "/api/queries?minDuration=0" : `/api/queries?connectionId=${selected}&minDuration=0`;
     try {
-      const res = await fetch(base);
+      const res = await fetch(`/api/queries?connectionId=${selected}&minDuration=0`);
       const data = await res.json();
       setQueries(data.queries ?? []);
       setLockWaits(data.lockWaits ?? []);
@@ -312,12 +366,16 @@ export default function QueryDashboard({ role }: { role: Role }) {
   }, [selected]);
 
   useEffect(() => {
+    if (!selected) {
+      setLoading(false);
+      return;
+    }
     setLoading(true);
     refresh();
     if (intervalMs <= 0) return; // "Off" — manual refresh only, via the button below
     const id = setInterval(refresh, intervalMs);
     return () => clearInterval(id);
-  }, [refresh, intervalMs]);
+  }, [refresh, intervalMs, selected]);
 
   const longRunning = useMemo(() => queries.filter((q) => q.durationSeconds >= threshold), [queries, threshold]);
 
@@ -331,14 +389,19 @@ export default function QueryDashboard({ role }: { role: Role }) {
         <div style={{ display: "flex", gap: 12, alignItems: "flex-end" }}>
           <div className="field" style={{ margin: 0 }}>
             <label htmlFor="machine">Database machine</label>
-            <select id="machine" value={selected} onChange={(e) => setSelected(e.target.value)}>
-              <option value="all">All machines</option>
-              {machines.map((m) => (
-                <option key={m.id} value={m.id}>
-                  {m.name}
-                </option>
-              ))}
-            </select>
+            {machines.length === 0 ? (
+              <select id="machine" disabled>
+                <option>No machines registered</option>
+              </select>
+            ) : (
+              <select id="machine" value={selected} onChange={(e) => setSelected(e.target.value)}>
+                {machines.map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.name}
+                  </option>
+                ))}
+              </select>
+            )}
           </div>
           <div className="field" style={{ margin: 0 }}>
             <label htmlFor="interval">Auto-refresh</label>
@@ -364,13 +427,7 @@ export default function QueryDashboard({ role }: { role: Role }) {
         ))}
 
       <div className="card" style={{ borderColor: lockWaits.length > 0 ? "var(--danger)" : undefined }}>
-        <h1 style={{ fontSize: 18, margin: 0 }}>🔒 Locked / blocked queries</h1>
-        <p className="muted" style={{ fontSize: 13, margin: "4px 0 16px" }}>
-          A session is stuck waiting for a lock another session is holding — usually the most urgent thing
-          to look at, since the session <em>holding</em> the lock is often idle and won&apos;t show up as
-          &quot;long-running&quot; at all. Killing the blocking session (not the waiting one) is normally
-          what actually fixes this.
-        </p>
+        <h1 style={{ fontSize: 18, margin: "0 0 16px" }}>Locked / blocked queries</h1>
         {loading && queries.length === 0 && lockWaits.length === 0 ? (
           <p className="muted">Loading…</p>
         ) : (
@@ -381,19 +438,19 @@ export default function QueryDashboard({ role }: { role: Role }) {
       <div className="card">
         <h1 style={{ fontSize: 18, margin: 0 }}>Long-running queries</h1>
         <p className="muted" style={{ fontSize: 13, margin: "4px 0 16px" }}>
-          Running {threshold}s or longer &middot; sorted longest-running first
+          Running {threshold}s or longer &middot; click a column header to sort
         </p>
         {loading && queries.length === 0 ? (
           <p className="muted">Loading…</p>
         ) : (
-          <QueryTable queries={longRunning} canKill={canKill} emptyMessage="No long-running queries right now. 🎉" />
+          <QueryTable queries={longRunning} canKill={canKill} emptyMessage="No long-running queries right now." />
         )}
       </div>
 
       <div className="card">
         <h1 style={{ fontSize: 18, margin: 0 }}>All currently running queries</h1>
         <p className="muted" style={{ fontSize: 13, margin: "4px 0 16px" }}>
-          Every query executing right now, sorted longest-running first
+          Every query executing right now &middot; click a column header to sort
         </p>
         {loading && queries.length === 0 ? (
           <p className="muted">Loading…</p>
