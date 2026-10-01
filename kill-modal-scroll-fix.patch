@@ -1,0 +1,29 @@
+diff --git a/src/app/globals.css b/src/app/globals.css
+index 2ffada6..8939d52 100644
+--- a/src/app/globals.css
++++ b/src/app/globals.css
+@@ -149,9 +149,24 @@ label { display: block; font-size: 13px; color: var(--text-dim); margin-bottom:
+   padding: 24px;
+   max-width: 560px;
+   width: 100%;
++  /* The overlay centers this box with 20px of padding on every side (see
++     .modal-overlay), so cap height to the viewport minus that padding and
++     let the box itself scroll. Without this, a long captured query (common
++     — real queries can run hundreds of lines) pushes the confirm input and
++     Kill/Cancel buttons below the bottom of the screen with no way to
++     reach them short of browser zoom. */
++  max-height: calc(100vh - 40px);
++  overflow-y: auto;
+   box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+ }
+ .modal-box h2 { margin: 0 0 4px; font-size: 17px; }
++.modal-box .query-text {
++  /* Keep the query preview from dominating the modal — it scrolls on its
++     own, so the confirm input and buttons stay close by instead of
++     requiring a scroll past a huge query first. */
++  max-height: 160px;
++  overflow-y: auto;
++}
+ .confirm-input {
+   width: 100%;
+   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
