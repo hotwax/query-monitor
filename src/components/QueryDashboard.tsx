@@ -3,6 +3,7 @@
 import { useEffect, useState, useCallback, useMemo } from "react";
 import Link from "next/link";
 import type { Role } from "@/lib/types";
+import BulkKillModal, { type BulkKillTarget } from "@/components/BulkKillModal";
 
 interface Machine {
   id: string;
@@ -92,6 +93,13 @@ function killHref(params: {
   return `/dashboard/kill/${params.connectionId}/${params.processId}?${q.toString()}`;
 }
 
+/** Matches a running query to its row across renders/tables — stable as
+ * long as the underlying MySQL thread is the same, which is exactly the
+ * lifetime a selection checkbox needs to track. */
+function rowKey(q: Pick<RunningQuery, "connectionId" | "processId">): string {
+  return `${q.connectionId}-${q.processId}`;
+}
+
 type SortKey = "duration" | "database" | "dbUser" | "clientHost";
 type SortDir = "asc" | "desc";
 
@@ -131,10 +139,15 @@ function QueryTable({
   queries,
   canKill,
   emptyMessage,
+  selected,
+  onToggleSelect,
 }: {
   queries: RunningQuery[];
   canKill: boolean;
   emptyMessage: string;
+  /** Keys (rowKey(q)) of currently selected rows, for bulk-kill. No "select all" — see BulkKillModal for why each row is picked deliberately. */
+  selected: Set<string>;
+  onToggleSelect: (query: RunningQuery) => void;
 }) {
   const [sortKey, setSortKey] = useState<SortKey>("duration");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
@@ -156,6 +169,7 @@ function QueryTable({
     <table>
       <thead>
         <tr>
+          {canKill && <th></th>}
           <SortableHeader label="Duration" sortKey="duration" activeKey={sortKey} activeDir={sortDir} onSort={handleSort} />
           <th>Machine</th>
           <SortableHeader label="Database" sortKey="database" activeKey={sortKey} activeDir={sortDir} onSort={handleSort} />
@@ -168,7 +182,12 @@ function QueryTable({
       </thead>
       <tbody>
         {sorted.map((q) => (
-          <tr key={`${q.connectionId}-${q.processId}`}>
+          <tr key={rowKey(q)}>
+            {canKill && (
+              <td>
+                <input type="checkbox" checked={selected.has(rowKey(q))} onChange={() => onToggleSelect(q)} />
+              </td>
+            )}
             <td className={durationClass(q.durationSeconds)}>{formatDuration(q.durationSeconds)}</td>
             <td>{q.connectionName}</td>
             <td>{q.database ?? <span className="muted">—</span>}</td>
@@ -306,6 +325,32 @@ export default function QueryDashboard({ role }: { role: Role }) {
   const [intervalMs, setIntervalMs] = useState<number>(DEFAULT_INTERVAL_MS);
   const canKill = role === "DEVOPS" || role === "ADMIN";
 
+  // Bulk-kill selection — keyed by rowKey() so a query checked in one table
+  // (e.g. "Long-running") shows checked in the other ("All currently
+  // running") too, since they can both list the same underlying process.
+  // Deliberately scoped to whichever machine is selected above: switching
+  // machines means a completely different set of queries, so the selection
+  // is cleared rather than silently carrying over.
+  const [selectedMap, setSelectedMap] = useState<Map<string, RunningQuery>>(new Map());
+  const [bulkModalOpen, setBulkModalOpen] = useState(false);
+
+  useEffect(() => {
+    setSelectedMap(new Map());
+  }, [selected]);
+
+  function toggleSelect(query: RunningQuery) {
+    setSelectedMap((prev) => {
+      const next = new Map(prev);
+      const key = rowKey(query);
+      if (next.has(key)) {
+        next.delete(key);
+      } else {
+        next.set(key, query);
+      }
+      return next;
+    });
+  }
+
   // Read the saved refresh-interval preference after mount only (not during
   // SSR) so the server-rendered and first client render match, then apply
   // whatever was saved from a previous visit.
@@ -426,6 +471,31 @@ export default function QueryDashboard({ role }: { role: Role }) {
           </div>
         ))}
 
+      {selectedMap.size > 0 && (
+        <div
+          className="card"
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            borderColor: "var(--accent)",
+            padding: "12px 20px",
+          }}
+        >
+          <span>
+            <strong>{selectedMap.size}</strong> selected
+          </span>
+          <div style={{ display: "flex", gap: 12 }}>
+            <button className="secondary" onClick={() => setSelectedMap(new Map())}>
+              Clear selection
+            </button>
+            <button className="danger" onClick={() => setBulkModalOpen(true)}>
+              Kill {selectedMap.size} Quer{selectedMap.size === 1 ? "y" : "ies"}
+            </button>
+          </div>
+        </div>
+      )}
+
       <div className="card" style={{ borderColor: lockWaits.length > 0 ? "var(--danger)" : undefined }}>
         <h1 style={{ fontSize: 18, margin: "0 0 16px" }}>Locked / blocked queries</h1>
         {loading && queries.length === 0 && lockWaits.length === 0 ? (
@@ -443,7 +513,13 @@ export default function QueryDashboard({ role }: { role: Role }) {
         {loading && queries.length === 0 ? (
           <p className="muted">Loading…</p>
         ) : (
-          <QueryTable queries={longRunning} canKill={canKill} emptyMessage="No long-running queries right now." />
+          <QueryTable
+            queries={longRunning}
+            canKill={canKill}
+            emptyMessage="No long-running queries right now."
+            selected={new Set(selectedMap.keys())}
+            onToggleSelect={toggleSelect}
+          />
         )}
       </div>
 
@@ -455,9 +531,44 @@ export default function QueryDashboard({ role }: { role: Role }) {
         {loading && queries.length === 0 ? (
           <p className="muted">Loading…</p>
         ) : (
-          <QueryTable queries={queries} canKill={canKill} emptyMessage="Nothing is running right now." />
+          <QueryTable
+            queries={queries}
+            canKill={canKill}
+            emptyMessage="Nothing is running right now."
+            selected={new Set(selectedMap.keys())}
+            onToggleSelect={toggleSelect}
+          />
         )}
       </div>
+
+      {bulkModalOpen && (
+        <BulkKillModal
+          connectionId={selected}
+          connectionName={machines.find((m) => m.id === selected)?.name ?? ""}
+          targets={Array.from(selectedMap.values()).map(
+            (q): BulkKillTarget => ({
+              processId: q.processId,
+              dbUsername: q.dbUsername,
+              database: q.database,
+              queryText: q.queryText,
+              durationSeconds: q.durationSeconds,
+            })
+          )}
+          onClose={() => setBulkModalOpen(false)}
+          onKillCompleted={(killedProcessIds) => {
+            const killed = new Set(killedProcessIds);
+            setSelectedMap((prev) => {
+              const next = new Map(prev);
+              for (const [key, q] of prev) {
+                if (killed.has(q.processId)) next.delete(key);
+              }
+              return next;
+            });
+            setBulkModalOpen(false);
+            refresh();
+          }}
+        />
+      )}
     </div>
   );
 }

@@ -1,0 +1,997 @@
+diff --git a/src/components/QueryDashboard.tsx b/src/components/QueryDashboard.tsx
+index 1cb77e6..edb5b57 100644
+--- a/src/components/QueryDashboard.tsx
++++ b/src/components/QueryDashboard.tsx
+@@ -3,6 +3,7 @@
+ import { useEffect, useState, useCallback, useMemo } from "react";
+ import Link from "next/link";
+ import type { Role } from "@/lib/types";
++import BulkKillModal, { type BulkKillTarget } from "@/components/BulkKillModal";
+ 
+ interface Machine {
+   id: string;
+@@ -92,6 +93,13 @@ function killHref(params: {
+   return `/dashboard/kill/${params.connectionId}/${params.processId}?${q.toString()}`;
+ }
+ 
++/** Matches a running query to its row across renders/tables — stable as
++ * long as the underlying MySQL thread is the same, which is exactly the
++ * lifetime a selection checkbox needs to track. */
++function rowKey(q: Pick<RunningQuery, "connectionId" | "processId">): string {
++  return `${q.connectionId}-${q.processId}`;
++}
++
+ type SortKey = "duration" | "database" | "dbUser" | "clientHost";
+ type SortDir = "asc" | "desc";
+ 
+@@ -131,10 +139,15 @@ function QueryTable({
+   queries,
+   canKill,
+   emptyMessage,
++  selected,
++  onToggleSelect,
+ }: {
+   queries: RunningQuery[];
+   canKill: boolean;
+   emptyMessage: string;
++  /** Keys (rowKey(q)) of currently selected rows, for bulk-kill. No "select all" — see BulkKillModal for why each row is picked deliberately. */
++  selected: Set<string>;
++  onToggleSelect: (query: RunningQuery) => void;
+ }) {
+   const [sortKey, setSortKey] = useState<SortKey>("duration");
+   const [sortDir, setSortDir] = useState<SortDir>("desc");
+@@ -156,6 +169,7 @@ function QueryTable({
+     <table>
+       <thead>
+         <tr>
++          {canKill && <th></th>}
+           <SortableHeader label="Duration" sortKey="duration" activeKey={sortKey} activeDir={sortDir} onSort={handleSort} />
+           <th>Machine</th>
+           <SortableHeader label="Database" sortKey="database" activeKey={sortKey} activeDir={sortDir} onSort={handleSort} />
+@@ -168,7 +182,12 @@ function QueryTable({
+       </thead>
+       <tbody>
+         {sorted.map((q) => (
+-          <tr key={`${q.connectionId}-${q.processId}`}>
++          <tr key={rowKey(q)}>
++            {canKill && (
++              <td>
++                <input type="checkbox" checked={selected.has(rowKey(q))} onChange={() => onToggleSelect(q)} />
++              </td>
++            )}
+             <td className={durationClass(q.durationSeconds)}>{formatDuration(q.durationSeconds)}</td>
+             <td>{q.connectionName}</td>
+             <td>{q.database ?? <span className="muted">—</span>}</td>
+@@ -306,6 +325,32 @@ export default function QueryDashboard({ role }: { role: Role }) {
+   const [intervalMs, setIntervalMs] = useState<number>(DEFAULT_INTERVAL_MS);
+   const canKill = role === "DEVOPS" || role === "ADMIN";
+ 
++  // Bulk-kill selection — keyed by rowKey() so a query checked in one table
++  // (e.g. "Long-running") shows checked in the other ("All currently
++  // running") too, since they can both list the same underlying process.
++  // Deliberately scoped to whichever machine is selected above: switching
++  // machines means a completely different set of queries, so the selection
++  // is cleared rather than silently carrying over.
++  const [selectedMap, setSelectedMap] = useState<Map<string, RunningQuery>>(new Map());
++  const [bulkModalOpen, setBulkModalOpen] = useState(false);
++
++  useEffect(() => {
++    setSelectedMap(new Map());
++  }, [selected]);
++
++  function toggleSelect(query: RunningQuery) {
++    setSelectedMap((prev) => {
++      const next = new Map(prev);
++      const key = rowKey(query);
++      if (next.has(key)) {
++        next.delete(key);
++      } else {
++        next.set(key, query);
++      }
++      return next;
++    });
++  }
++
+   // Read the saved refresh-interval preference after mount only (not during
+   // SSR) so the server-rendered and first client render match, then apply
+   // whatever was saved from a previous visit.
+@@ -426,6 +471,31 @@ export default function QueryDashboard({ role }: { role: Role }) {
+           </div>
+         ))}
+ 
++      {selectedMap.size > 0 && (
++        <div
++          className="card"
++          style={{
++            display: "flex",
++            justifyContent: "space-between",
++            alignItems: "center",
++            borderColor: "var(--accent)",
++            padding: "12px 20px",
++          }}
++        >
++          <span>
++            <strong>{selectedMap.size}</strong> selected
++          </span>
++          <div style={{ display: "flex", gap: 12 }}>
++            <button className="secondary" onClick={() => setSelectedMap(new Map())}>
++              Clear selection
++            </button>
++            <button className="danger" onClick={() => setBulkModalOpen(true)}>
++              Kill {selectedMap.size} Quer{selectedMap.size === 1 ? "y" : "ies"}
++            </button>
++          </div>
++        </div>
++      )}
++
+       <div className="card" style={{ borderColor: lockWaits.length > 0 ? "var(--danger)" : undefined }}>
+         <h1 style={{ fontSize: 18, margin: "0 0 16px" }}>Locked / blocked queries</h1>
+         {loading && queries.length === 0 && lockWaits.length === 0 ? (
+@@ -443,7 +513,13 @@ export default function QueryDashboard({ role }: { role: Role }) {
+         {loading && queries.length === 0 ? (
+           <p className="muted">Loading…</p>
+         ) : (
+-          <QueryTable queries={longRunning} canKill={canKill} emptyMessage="No long-running queries right now." />
++          <QueryTable
++            queries={longRunning}
++            canKill={canKill}
++            emptyMessage="No long-running queries right now."
++            selected={new Set(selectedMap.keys())}
++            onToggleSelect={toggleSelect}
++          />
+         )}
+       </div>
+ 
+@@ -455,9 +531,44 @@ export default function QueryDashboard({ role }: { role: Role }) {
+         {loading && queries.length === 0 ? (
+           <p className="muted">Loading…</p>
+         ) : (
+-          <QueryTable queries={queries} canKill={canKill} emptyMessage="Nothing is running right now." />
++          <QueryTable
++            queries={queries}
++            canKill={canKill}
++            emptyMessage="Nothing is running right now."
++            selected={new Set(selectedMap.keys())}
++            onToggleSelect={toggleSelect}
++          />
+         )}
+       </div>
++
++      {bulkModalOpen && (
++        <BulkKillModal
++          connectionId={selected}
++          connectionName={machines.find((m) => m.id === selected)?.name ?? ""}
++          targets={Array.from(selectedMap.values()).map(
++            (q): BulkKillTarget => ({
++              processId: q.processId,
++              dbUsername: q.dbUsername,
++              database: q.database,
++              queryText: q.queryText,
++              durationSeconds: q.durationSeconds,
++            })
++          )}
++          onClose={() => setBulkModalOpen(false)}
++          onKillCompleted={(killedProcessIds) => {
++            const killed = new Set(killedProcessIds);
++            setSelectedMap((prev) => {
++              const next = new Map(prev);
++              for (const [key, q] of prev) {
++                if (killed.has(q.processId)) next.delete(key);
++              }
++              return next;
++            });
++            setBulkModalOpen(false);
++            refresh();
++          }}
++        />
++      )}
+     </div>
+   );
+ }
+diff --git a/src/app/api/kill-execute-bulk/route.ts b/src/app/api/kill-execute-bulk/route.ts
+new file mode 100644
+index 0000000..7f8a9ba
+--- /dev/null
++++ b/src/app/api/kill-execute-bulk/route.ts
+@@ -0,0 +1,98 @@
++import { NextRequest, NextResponse } from "next/server";
++import { prisma } from "@/lib/db";
++import { getSession } from "@/lib/session";
++import { roleAllows, CAN_REVEAL_KILL_COMMAND } from "@/lib/rbac";
++import { killProcess, clamp, type KillResult } from "@/lib/kill-process";
++
++// Not a hard product requirement — just a sanity backstop against a
++// pathological request (e.g. a bug sending the same selection twice). The
++// Dashboard's bulk-select is meant for a handful to a few dozen queries at
++// a time; this just keeps one request from trying to march through
++// hundreds of kills unattended.
++const MAX_BATCH = 100;
++
++interface BulkRequestItem {
++  processId: number;
++  dbUsername: string | null;
++  database: string | null;
++  queryText: string | null;
++}
++
++/**
++ * Kills several processes on ONE machine in a single request — the
++ * Dashboard's "Kill N Queries" bulk action. Scoped to one connection
++ * deliberately: the Dashboard only ever shows/selects queries for whichever
++ * machine is currently chosen in the dropdown, so there is never a mixed
++ * batch spanning machines to worry about here.
++ *
++ * Loops through the batch SEQUENTIALLY, calling the same src/lib/kill-process.ts
++ * used by the single-query /api/kill-execute route for every item — same
++ * live pre-kill safety check, same audit trail, one row per process either
++ * way. A failure on one item (already finished, a protected system account,
++ * a transient connection error) does not stop the rest of the batch from
++ * being attempted; the full per-item outcome comes back in `results` for
++ * the UI to show individually.
++ */
++export async function POST(req: NextRequest) {
++  const session = await getSession();
++  if (!session || !roleAllows(session.role, CAN_REVEAL_KILL_COMMAND)) {
++    return NextResponse.json({ error: "Forbidden" }, { status: 403 });
++  }
++
++  const body = await req.json().catch(() => null);
++  const connectionId = typeof body?.connectionId === "string" ? body.connectionId : null;
++  const rawProcesses = Array.isArray(body?.processes) ? body.processes : [];
++
++  if (!connectionId) {
++    return NextResponse.json({ error: "connectionId is required." }, { status: 400 });
++  }
++  if (rawProcesses.length === 0) {
++    return NextResponse.json({ error: "At least one process is required." }, { status: 400 });
++  }
++  if (rawProcesses.length > MAX_BATCH) {
++    return NextResponse.json(
++      { error: `Refusing to kill more than ${MAX_BATCH} queries in a single bulk action.` },
++      { status: 400 }
++    );
++  }
++
++  const items: BulkRequestItem[] = [];
++  for (const raw of rawProcesses) {
++    const processId = Number(raw?.processId);
++    if (!Number.isFinite(processId)) {
++      return NextResponse.json({ error: "Every process requires a numeric processId." }, { status: 400 });
++    }
++    items.push({
++      processId,
++      dbUsername: clamp(raw?.dbUsername, 200),
++      database: clamp(raw?.database, 200),
++      queryText: clamp(raw?.queryText),
++    });
++  }
++
++  const connection = await prisma.dbConnection.findUnique({ where: { id: connectionId } });
++  if (!connection) {
++    return NextResponse.json({ error: "Unknown database machine." }, { status: 404 });
++  }
++
++  // Sequential, not parallel: every item here hits the SAME database
++  // instance, so running them one after another keeps this predictable
++  // (results arrive in a stable order) and avoids opening a burst of
++  // simultaneous kill-account connections against production for a large
++  // batch. For the batch sizes this feature targets, total time stays well
++  // within a normal request timeout.
++  const results: KillResult[] = [];
++  for (const item of items) {
++    const result = await killProcess({
++      connection,
++      processId: item.processId,
++      actorEmail: session.email,
++      actorId: session.sub,
++      captured: { dbUsername: item.dbUsername, database: item.database, queryText: item.queryText },
++      bulk: true,
++    });
++    results.push(result);
++  }
++
++  return NextResponse.json({ connectionName: connection.name, results });
++}
+diff --git a/src/app/api/kill-execute/route.ts b/src/app/api/kill-execute/route.ts
+index 15ea327..1a32539 100644
+--- a/src/app/api/kill-execute/route.ts
++++ b/src/app/api/kill-execute/route.ts
+@@ -1,18 +1,8 @@
+ import { NextRequest, NextResponse } from "next/server";
+-import mysql from "mysql2/promise";
+ import { prisma } from "@/lib/db";
+ import { getSession } from "@/lib/session";
+-import { logAudit } from "@/lib/audit";
+ import { roleAllows, CAN_REVEAL_KILL_COMMAND } from "@/lib/rbac";
+-import { resolveKillCredentials } from "@/lib/kill-credentials";
+-import { NEVER_MONITOR_OR_KILL_USERS } from "@/lib/mysql-collector";
+-
+-const CONNECT_TIMEOUT_MS = 5000;
+-
+-function clamp(v: unknown, max = 2000): string | null {
+-  if (typeof v !== "string" || v.length === 0) return null;
+-  return v.length > max ? v.slice(0, max) + "…" : v;
+-}
++import { killProcess, clamp } from "@/lib/kill-process";
+ 
+ /**
+  * Actually kills a query/session — the one deliberate exception to this
+@@ -27,17 +17,11 @@ function clamp(v: unknown, max = 2000): string | null {
+  * removes a manual copy/paste step without meaningfully changing what a
+  * compromised session could do.
+  *
+- * Always kills the WHOLE connection (mysql.rds_kill / plain KILL) —
+- * matching exactly the `KILL <id>;` this team always ran by hand, which
+- * also drops any locks the connection was holding, not just the one
+- * statement. There is deliberately no "kill just the query, leave the
+- * connection open" path here (that would be mysql.rds_kill_query / KILL
+- * QUERY) — this app only ever does a full kill.
+- *
+- * Every attempt is logged — success (KILL_EXECUTED) or failure
+- * (KILL_FAILED) — with who, when, which machine/process, and the captured
+- * query context. See also VIEWED_KILL_PAGE and CHECKED_STATUS, logged
+- * elsewhere in this same flow, for the full trail.
++ * This route handles exactly ONE process. See /api/kill-execute-bulk for
++ * killing several at once from the Dashboard's bulk-select — both routes
++ * call the same src/lib/kill-process.ts for the actual safety-checked kill,
++ * so the live pre-kill check and the audit trail can never drift apart
++ * between the two.
+  */
+ export async function POST(req: NextRequest) {
+   const session = await getSession();
+@@ -48,8 +32,6 @@ export async function POST(req: NextRequest) {
+   const body = await req.json().catch(() => null);
+   const connectionId = typeof body?.connectionId === "string" ? body.connectionId : null;
+   const processId = Number(body?.processId);
+-  // Always a full connection kill — see the module doc comment above.
+-  const method = "CONNECTION" as const;
+   const capturedDbUsername = clamp(body?.dbUsername, 200);
+   const capturedDatabase = clamp(body?.database, 200);
+   const capturedQueryText = clamp(body?.queryText);
+@@ -63,136 +45,16 @@ export async function POST(req: NextRequest) {
+     return NextResponse.json({ error: "Unknown database machine." }, { status: 404 });
+   }
+ 
+-  const baseDetail = {
++  const result = await killProcess({
++    connection,
+     processId,
+-    method,
+-    connectionName: connection.name,
+-    dbUsername: capturedDbUsername,
+-    database: capturedDatabase,
+-    queryText: capturedQueryText,
+-  };
+-
+-  let username: string;
+-  let password: string;
+-  try {
+-    ({ username, password } = resolveKillCredentials(connection));
+-  } catch (err) {
+-    const message = err instanceof Error ? err.message : "No kill account credential configured.";
+-    const isConfigMissing = message.includes("No kill account credential available");
+-    if (!isConfigMissing) {
+-      console.error(`[kill-execute] Failed to resolve kill account credential for ${connection.name}.`, err);
+-    }
+-    await logAudit({
+-      actorEmail: session.email,
+-      actorId: session.sub,
+-      action: "KILL_FAILED",
+-      connectionId,
+-      detail: { ...baseDetail, error: "credential-resolution-failed" },
+-    });
+-    return NextResponse.json(
+-      {
+-        error: isConfigMissing
+-          ? message
+-          : `Could not resolve the kill account credential for ${connection.name}. This usually means APP_ENCRYPTION_KEY changed since a per-machine override was saved.`,
+-      },
+-      { status: isConfigMissing ? 409 : 500 }
+-    );
+-  }
+-
+-  const statement = connection.killMethod === "DIRECT_KILL" ? `KILL ${processId}` : "CALL mysql.rds_kill(?)";
+-  // Plain KILL doesn't support a bound placeholder in MySQL, so DIRECT_KILL
+-  // inlines processId directly — safe here since it was validated with
+-  // Number.isFinite above, never taken from a raw string.
+-  const params = connection.killMethod === "DIRECT_KILL" ? [] : [processId];
+-
+-  // Never-kill list: MySQL/MariaDB/AWS-RDS-internal accounts. Derived from
+-  // the SAME array mysql-collector.ts uses to keep these accounts off
+-  // every list the app shows (see NEVER_MONITOR_OR_KILL_USERS there for
+-  // the full, evidence-backed rationale for each entry) — one shared
+-  // source of truth, so the display filter and this kill-safety gate can
+-  // never drift out of sync. Killing one of these (e.g. a replica's
+-  // replication threads, or an RDS-internal management account) risks
+-  // breaking replication or RDS's own management of the instance, a far
+-  // bigger incident than any slow query this app exists to catch. This is
+-  // the actual safety boundary: it's checked here, live, right before the
+-  // kill executes, using the CURRENT PROCESSLIST state rather than
+-  // trusting whatever the client sent — so a stale UI, a reused/recycled
+-  // process id, or a hand-crafted request all get the same protection,
+-  // not just the dashboard's display.
+-  const NEVER_KILL_USERS = new Set<string>(NEVER_MONITOR_OR_KILL_USERS);
+-
+-  let conn: mysql.Connection | null = null;
+-  try {
+-    conn = await mysql.createConnection({
+-      host: connection.host,
+-      port: connection.port,
+-      user: username,
+-      password,
+-      connectTimeout: CONNECT_TIMEOUT_MS,
+-    });
+-
+-    const [liveRows] = await conn.query<mysql.RowDataPacket[]>(
+-      "SELECT USER FROM information_schema.PROCESSLIST WHERE ID = ?",
+-      [processId]
+-    );
+-    const liveUser: string | null = liveRows[0]?.USER ?? null;
+-
+-    if (liveUser === null) {
+-      await logAudit({
+-        actorEmail: session.email,
+-        actorId: session.sub,
+-        action: "KILL_FAILED",
+-        connectionId,
+-        detail: { ...baseDetail, error: "process-no-longer-running" },
+-      });
+-      return NextResponse.json(
+-        { error: `Process ${processId} is no longer running — nothing to kill.` },
+-        { status: 409 }
+-      );
+-    }
+-
+-    if (NEVER_KILL_USERS.has(liveUser)) {
+-      await logAudit({
+-        actorEmail: session.email,
+-        actorId: session.sub,
+-        action: "KILL_BLOCKED_SYSTEM_PROCESS",
+-        connectionId,
+-        detail: { ...baseDetail, liveUser },
+-      });
+-      return NextResponse.json(
+-        {
+-          error: `Refused: process ${processId} belongs to MySQL/MariaDB's or AWS RDS's internal "${liveUser}" account. Killing it could break replication or RDS's own management of this instance. This app will never kill this account, regardless of what triggered the request.`,
+-        },
+-        { status: 403 }
+-      );
+-    }
+-
+-    await conn.query(statement, params);
+-
+-    await logAudit({
+-      actorEmail: session.email,
+-      actorId: session.sub,
+-      action: "KILL_EXECUTED",
+-      connectionId,
+-      detail: { ...baseDetail, killAccount: username },
+-    });
++    actorEmail: session.email,
++    actorId: session.sub,
++    captured: { dbUsername: capturedDbUsername, database: capturedDatabase, queryText: capturedQueryText },
++  });
+ 
+-    return NextResponse.json({ ok: true, processId, method, connectionName: connection.name });
+-  } catch (err) {
+-    const message = err instanceof Error ? err.message : "Unknown error while killing the query.";
+-    console.error(`[kill-execute] Failed to kill process ${processId} on ${connection.name}:`, err);
+-    await logAudit({
+-      actorEmail: session.email,
+-      actorId: session.sub,
+-      action: "KILL_FAILED",
+-      connectionId,
+-      detail: { ...baseDetail, killAccount: username, error: clamp(message, 500) },
+-    });
+-    return NextResponse.json(
+-      { error: `Could not kill process ${processId}: ${message}` },
+-      { status: 502 }
+-    );
+-  } finally {
+-    await conn?.end().catch(() => undefined);
++  if (!result.ok) {
++    return NextResponse.json({ error: result.error }, { status: result.status ?? 500 });
+   }
++  return NextResponse.json({ ok: true, processId, method: "CONNECTION", connectionName: connection.name });
+ }
+diff --git a/src/components/BulkKillModal.tsx b/src/components/BulkKillModal.tsx
+new file mode 100644
+index 0000000..749379c
+--- /dev/null
++++ b/src/components/BulkKillModal.tsx
+@@ -0,0 +1,313 @@
++"use client";
++
++import { useState } from "react";
++
++export interface BulkKillTarget {
++  processId: number;
++  dbUsername: string;
++  database: string | null;
++  queryText: string | null;
++  durationSeconds: number;
++}
++
++interface LiveStatus {
++  running: boolean;
++  durationSeconds?: number;
++}
++
++interface ItemResult {
++  ok: boolean;
++  error?: string;
++}
++
++const CONFIRM_WORD = "confirm";
++
++function formatDuration(seconds: number): string {
++  if (seconds < 60) return `${seconds}s`;
++  const m = Math.floor(seconds / 60);
++  const s = seconds % 60;
++  return `${m}m ${s}s`;
++}
++
++/**
++ * Confirmation + execution flow for killing several queries at once from
++ * the Dashboard's checkbox selection. Deliberately a modal rather than a
++ * page navigation like the single-query Kill page — the captured details
++ * (including full query text, which can run hundreds of lines — see
++ * kill-modal-scroll-fix) can't travel through a URL for more than one
++ * query at a time, but the Dashboard already holds the full selected
++ * objects in memory, so this just renders straight from that.
++ *
++ * "Check current status" re-checks every selected query against what's
++ * ACTUALLY still running right now (the selection can go stale the same
++ * way a single query's status can — see KillCommandPanel.tsx). Anything
++ * confirmed to have already finished is excluded from the kill batch
++ * automatically rather than being sent to /api/kill-execute-bulk at all —
++ * there's nothing to kill, so there's nothing to attempt.
++ */
++export default function BulkKillModal({
++  connectionId,
++  connectionName,
++  targets,
++  onClose,
++  onKillCompleted,
++}: {
++  connectionId: string;
++  connectionName: string;
++  targets: BulkKillTarget[];
++  /** Dismiss without having killed anything (Cancel, or the overlay click). */
++  onClose: () => void;
++  /** Fires once the batch request has finished; passes the processIds that were actually killed so the Dashboard can drop them from the selection. */
++  onKillCompleted: (killedProcessIds: number[]) => void;
++}) {
++  const [liveStatus, setLiveStatus] = useState<Map<number, LiveStatus>>(new Map());
++  const [checkingStatus, setCheckingStatus] = useState(false);
++  const [checkedAt, setCheckedAt] = useState<Date | null>(null);
++  const [confirmText, setConfirmText] = useState("");
++  const [killing, setKilling] = useState(false);
++  const [batchError, setBatchError] = useState<string | null>(null);
++  const [results, setResults] = useState<Map<number, ItemResult> | null>(null);
++
++  // Anything explicitly confirmed as no-longer-running gets excluded; an
++  // unchecked query (status never looked up) is treated the same as today's
++  // single-kill page treats it — assumed possibly still running, and left
++  // for the live pre-kill check inside /api/kill-execute-bulk to catch if
++  // it turns out to have finished in the meantime.
++  const toKill = targets.filter((t) => liveStatus.get(t.processId)?.running !== false);
++
++  async function checkStatus() {
++    setCheckingStatus(true);
++    setBatchError(null);
++    try {
++      const res = await fetch(`/api/queries?connectionId=${connectionId}&minDuration=0`);
++      const data = await res.json();
++      if (!res.ok) {
++        setBatchError(data?.error ?? "Could not check status.");
++        return;
++      }
++      interface LiveQueryRow {
++        processId: number;
++        durationSeconds: number;
++      }
++      const liveById = new Map<number, LiveQueryRow>(
++        (data.queries ?? []).map((q: LiveQueryRow) => [q.processId, q])
++      );
++      const next = new Map<number, LiveStatus>();
++      for (const t of targets) {
++        const match = liveById.get(t.processId);
++        next.set(t.processId, { running: Boolean(match), durationSeconds: match?.durationSeconds });
++      }
++      setLiveStatus(next);
++      setCheckedAt(new Date());
++
++      // Best-effort event trail, same as the single-kill page's "Check
++      // current status" — a logging hiccup shouldn't block the check itself.
++      for (const t of targets) {
++        fetch("/api/kill-log", {
++          method: "POST",
++          headers: { "Content-Type": "application/json" },
++          body: JSON.stringify({
++            action: "CHECKED_STATUS",
++            connectionId,
++            processId: t.processId,
++            running: Boolean(liveById.get(t.processId)),
++            dbUsername: t.dbUsername,
++            database: t.database,
++            queryText: t.queryText,
++          }),
++        }).catch(() => undefined);
++      }
++    } catch (err) {
++      setBatchError(err instanceof Error ? err.message : "Could not check status — a network error occurred.");
++    } finally {
++      setCheckingStatus(false);
++    }
++  }
++
++  async function killNow() {
++    setKilling(true);
++    setBatchError(null);
++    try {
++      const res = await fetch("/api/kill-execute-bulk", {
++        method: "POST",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({
++          connectionId,
++          processes: toKill.map((t) => ({
++            processId: t.processId,
++            dbUsername: t.dbUsername,
++            database: t.database,
++            queryText: t.queryText,
++          })),
++        }),
++      });
++      const data = await res.json().catch(() => null);
++      if (!res.ok) {
++        setBatchError(data?.error ?? `Could not run the bulk kill (HTTP ${res.status}).`);
++        return;
++      }
++      interface ApiResult {
++        processId: number;
++        ok: boolean;
++        error?: string;
++      }
++      const resultMap = new Map<number, ItemResult>(
++        (data.results ?? []).map((r: ApiResult) => [r.processId, { ok: r.ok, error: r.error }])
++      );
++      setResults(resultMap);
++    } catch (err) {
++      setBatchError(err instanceof Error ? err.message : "Could not run the bulk kill — a network error occurred.");
++    } finally {
++      setKilling(false);
++    }
++  }
++
++  function close() {
++    if (results) {
++      const killedIds = Array.from(results.entries())
++        .filter(([, r]) => r.ok)
++        .map(([processId]) => processId);
++      onKillCompleted(killedIds);
++    } else {
++      onClose();
++    }
++  }
++
++  const confirmMatches = confirmText.trim().toLowerCase() === CONFIRM_WORD;
++  const alreadyFinishedCount = targets.length - toKill.length;
++
++  return (
++    <div className="modal-overlay" onClick={() => !killing && close()}>
++      <div className="modal-box" style={{ maxWidth: 680 }} onClick={(e) => e.stopPropagation()}>
++        <h2>
++          Kill {targets.length} quer{targets.length === 1 ? "y" : "ies"}?
++        </h2>
++        <p className="muted" style={{ fontSize: 13.5, marginBottom: 16 }}>
++          on <strong>{connectionName}</strong>
++        </p>
++
++        {!results && (
++          <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12, flexWrap: "wrap" }}>
++            <button className="secondary" onClick={checkStatus} disabled={checkingStatus || killing}>
++              {checkingStatus ? "Checking…" : "Check current status"}
++            </button>
++            {checkedAt && (
++              <span className="muted" style={{ fontSize: 12.5 }}>
++                Checked {checkedAt.toLocaleTimeString()}
++                {alreadyFinishedCount > 0
++                  ? ` — ${alreadyFinishedCount} already finished and will be skipped`
++                  : " — all still running"}
++              </span>
++            )}
++          </div>
++        )}
++
++        <div
++          style={{
++            maxHeight: 320,
++            overflowY: "auto",
++            marginBottom: 16,
++            border: "1px solid var(--border)",
++            borderRadius: 8,
++          }}
++        >
++          <table style={{ marginBottom: 0 }}>
++            <tbody>
++              {targets.map((t) => {
++                const live = liveStatus.get(t.processId);
++                const finished = live?.running === false;
++                const result = results?.get(t.processId);
++                return (
++                  <tr key={t.processId} style={finished ? { opacity: 0.55 } : undefined}>
++                    <td>
++                      <div>
++                        <strong>#{t.processId}</strong> · {t.dbUsername}
++                        {t.database ? <> · {t.database}</> : null} ·{" "}
++                        <span className="muted">{formatDuration(live?.durationSeconds ?? t.durationSeconds)}</span>
++                      </div>
++                      {t.queryText && (
++                        <div className="query-text" style={{ marginTop: 4 }}>
++                          {t.queryText}
++                        </div>
++                      )}
++                    </td>
++                    <td style={{ whiteSpace: "nowrap", verticalAlign: "top", textAlign: "right" }}>
++                      {result ? (
++                        result.ok ? (
++                          <span style={{ color: "var(--ok)" }}>✓ Killed</span>
++                        ) : (
++                          <span style={{ color: "var(--danger)" }}>✕ {result.error ?? "Failed"}</span>
++                        )
++                      ) : finished ? (
++                        <span className="muted">Already finished — skipped</span>
++                      ) : live?.running === true ? (
++                        <span style={{ color: "var(--ok)" }}>● Still running</span>
++                      ) : (
++                        <span className="muted">Not checked</span>
++                      )}
++                    </td>
++                  </tr>
++                );
++              })}
++            </tbody>
++          </table>
++        </div>
++
++        {!results && (
++          <>
++            {toKill.length === 0 ? (
++              <div className="alert">All selected queries have already finished — there is nothing to kill.</div>
++            ) : (
++              <>
++                <div className="alert error">
++                  This will immediately terminate {toKill.length} connection{toKill.length === 1 ? "" : "s"} and any
++                  quer{toKill.length === 1 ? "y" : "ies"} running on {toKill.length === 1 ? "it" : "them"}. This
++                  action is <strong>destructive and cannot be undone</strong>.
++                </div>
++                <div className="field">
++                  <label htmlFor="bulk-confirm-word">
++                    Type <strong>confirm</strong> to proceed
++                  </label>
++                  <input
++                    id="bulk-confirm-word"
++                    className="confirm-input"
++                    autoFocus
++                    value={confirmText}
++                    onChange={(e) => setConfirmText(e.target.value)}
++                    placeholder="confirm"
++                  />
++                </div>
++              </>
++            )}
++          </>
++        )}
++
++        {batchError && <div className="alert error">{batchError}</div>}
++
++        {results && (
++          <div className="alert ok">
++            {Array.from(results.values()).filter((r) => r.ok).length} of {toKill.length} killed
++            {alreadyFinishedCount > 0 ? ` (${alreadyFinishedCount} already finished, skipped)` : ""}.
++          </div>
++        )}
++
++        <div style={{ display: "flex", gap: 12, justifyContent: "flex-end", marginTop: 8 }}>
++          {results ? (
++            <button className="secondary" onClick={close}>
++              Close
++            </button>
++          ) : (
++            <>
++              <button className="secondary" onClick={onClose} disabled={killing}>
++                Cancel
++              </button>
++              <button className="danger" onClick={killNow} disabled={!confirmMatches || killing || toKill.length === 0}>
++                {killing ? "Killing…" : `Kill ${toKill.length} Quer${toKill.length === 1 ? "y" : "ies"}`}
++              </button>
++            </>
++          )}
++        </div>
++      </div>
++    </div>
++  );
++}
+diff --git a/src/lib/kill-process.ts b/src/lib/kill-process.ts
+new file mode 100644
+index 0000000..0bd9aec
+--- /dev/null
++++ b/src/lib/kill-process.ts
+@@ -0,0 +1,176 @@
++import mysql from "mysql2/promise";
++import type { DbConnection } from "@prisma/client";
++import { logAudit } from "@/lib/audit";
++import { NEVER_MONITOR_OR_KILL_USERS } from "@/lib/mysql-collector";
++import { resolveKillCredentials } from "@/lib/kill-credentials";
++
++const CONNECT_TIMEOUT_MS = 5000;
++
++// Never-kill list: MySQL/MariaDB/AWS-RDS-internal accounts. Derived from the
++// SAME array mysql-collector.ts uses to keep these accounts off every list
++// the app shows (see NEVER_MONITOR_OR_KILL_USERS there for the full,
++// evidence-backed rationale for each entry) — one shared source of truth, so
++// the display filter and this kill-safety gate can never drift out of sync.
++const NEVER_KILL_USERS = new Set<string>(NEVER_MONITOR_OR_KILL_USERS);
++
++export function clamp(v: unknown, max = 2000): string | null {
++  if (typeof v !== "string" || v.length === 0) return null;
++  return v.length > max ? v.slice(0, max) + "…" : v;
++}
++
++export interface CapturedQueryDetail {
++  dbUsername: string | null;
++  database: string | null;
++  queryText: string | null;
++}
++
++export interface KillResult {
++  processId: number;
++  ok: boolean;
++  error?: string;
++  /** HTTP-ish status, for callers that map one result straight to a response. */
++  status?: number;
++}
++
++/**
++ * Does the actual work of killing ONE process on ONE machine — live
++ * pre-kill safety check, the kill itself, and the audit trail — used by
++ * BOTH /api/kill-execute (one query at a time) and /api/kill-execute-bulk
++ * (many at once). Pulled out into one shared function so the two routes can
++ * never drift apart on the safety-critical part: the live re-check against
++ * NEVER_MONITOR_OR_KILL_USERS happens here, once, right before every single
++ * kill, using the CURRENT PROCESSLIST state rather than trusting whatever
++ * the caller believes is still running.
++ *
++ * Always a full connection kill (mysql.rds_kill / plain KILL) — see the
++ * module doc comment on the original /api/kill-execute route for why there
++ * is deliberately no "kill just the query" path.
++ */
++export async function killProcess(params: {
++  connection: DbConnection;
++  processId: number;
++  actorEmail: string;
++  actorId?: string;
++  captured: CapturedQueryDetail;
++  /** Tags the audit entry so it's visible in Kill Log detail that this kill was part of a bulk action. */
++  bulk?: boolean;
++}): Promise<KillResult> {
++  const { connection, processId, actorEmail, actorId, captured, bulk } = params;
++
++  const baseDetail = {
++    processId,
++    method: "CONNECTION" as const,
++    connectionName: connection.name,
++    dbUsername: captured.dbUsername,
++    database: captured.database,
++    queryText: captured.queryText,
++    ...(bulk ? { bulk: true } : {}),
++  };
++
++  let username: string;
++  let password: string;
++  try {
++    ({ username, password } = resolveKillCredentials(connection));
++  } catch (err) {
++    const message = err instanceof Error ? err.message : "No kill account credential configured.";
++    const isConfigMissing = message.includes("No kill account credential available");
++    if (!isConfigMissing) {
++      console.error(`[kill-process] Failed to resolve kill account credential for ${connection.name}.`, err);
++    }
++    await logAudit({
++      actorEmail,
++      actorId,
++      action: "KILL_FAILED",
++      connectionId: connection.id,
++      detail: { ...baseDetail, error: "credential-resolution-failed" },
++    });
++    return {
++      processId,
++      ok: false,
++      status: isConfigMissing ? 409 : 500,
++      error: isConfigMissing
++        ? message
++        : `Could not resolve the kill account credential for ${connection.name}. This usually means APP_ENCRYPTION_KEY changed since a per-machine override was saved.`,
++    };
++  }
++
++  const statement = connection.killMethod === "DIRECT_KILL" ? `KILL ${processId}` : "CALL mysql.rds_kill(?)";
++  // Plain KILL doesn't support a bound placeholder in MySQL, so DIRECT_KILL
++  // inlines processId directly — safe here since it was validated as a
++  // finite number before this function is ever called.
++  const statementParams = connection.killMethod === "DIRECT_KILL" ? [] : [processId];
++
++  let conn: mysql.Connection | null = null;
++  try {
++    conn = await mysql.createConnection({
++      host: connection.host,
++      port: connection.port,
++      user: username,
++      password,
++      connectTimeout: CONNECT_TIMEOUT_MS,
++    });
++
++    const [liveRows] = await conn.query<mysql.RowDataPacket[]>(
++      "SELECT USER FROM information_schema.PROCESSLIST WHERE ID = ?",
++      [processId]
++    );
++    const liveUser: string | null = liveRows[0]?.USER ?? null;
++
++    if (liveUser === null) {
++      await logAudit({
++        actorEmail,
++        actorId,
++        action: "KILL_FAILED",
++        connectionId: connection.id,
++        detail: { ...baseDetail, error: "process-no-longer-running" },
++      });
++      return {
++        processId,
++        ok: false,
++        status: 409,
++        error: `Process ${processId} is no longer running — nothing to kill.`,
++      };
++    }
++
++    if (NEVER_KILL_USERS.has(liveUser)) {
++      await logAudit({
++        actorEmail,
++        actorId,
++        action: "KILL_BLOCKED_SYSTEM_PROCESS",
++        connectionId: connection.id,
++        detail: { ...baseDetail, liveUser },
++      });
++      return {
++        processId,
++        ok: false,
++        status: 403,
++        error: `Refused: process ${processId} belongs to MySQL/MariaDB's or AWS RDS's internal "${liveUser}" account. Killing it could break replication or RDS's own management of this instance. This app will never kill this account, regardless of what triggered the request.`,
++      };
++    }
++
++    await conn.query(statement, statementParams);
++
++    await logAudit({
++      actorEmail,
++      actorId,
++      action: "KILL_EXECUTED",
++      connectionId: connection.id,
++      detail: { ...baseDetail, killAccount: username },
++    });
++
++    return { processId, ok: true };
++  } catch (err) {
++    const message = err instanceof Error ? err.message : "Unknown error while killing the query.";
++    console.error(`[kill-process] Failed to kill process ${processId} on ${connection.name}:`, err);
++    await logAudit({
++      actorEmail,
++      actorId,
++      action: "KILL_FAILED",
++      connectionId: connection.id,
++      detail: { ...baseDetail, killAccount: username, error: clamp(message, 500) },
++    });
++    return { processId, ok: false, status: 502, error: `Could not kill process ${processId}: ${message}` };
++  } finally {
++    await conn?.end().catch(() => undefined);
++  }
++}
