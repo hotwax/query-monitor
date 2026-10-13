@@ -4,6 +4,7 @@ import { Fragment, useEffect, useState, useCallback, useMemo } from "react";
 import Link from "next/link";
 import type { Role } from "@/lib/types";
 import BulkKillModal, { type BulkKillTarget } from "@/components/BulkKillModal";
+import { CopyButton, QueryPreview, ViewQueryModal, type ViewQueryTarget } from "@/components/QueryPreview";
 
 interface Machine {
   id: string;
@@ -261,10 +262,13 @@ function QueryTable({
   selected,
   onToggleSelect,
   machineId,
+  onView,
 }: {
   queries: RunningQuery[];
   canKill: boolean;
   emptyMessage: string;
+  /** Opens the "View query" popup for a row (state lives in QueryDashboard so the popup survives the row finishing). */
+  onView: (target: ViewQueryTarget) => void;
   /** Keys (rowKey(q)) of currently selected rows, for bulk-kill. No "select all" — see BulkKillModal for why each row is picked deliberately. */
   selected: Set<string>;
   onToggleSelect: (query: RunningQuery) => void;
@@ -315,7 +319,7 @@ function QueryTable({
   const sorted = sortQueries(queries, sortKey, sortDir);
   const final = applyFocus(sorted, focus);
   const pinnedCount = focus ? final.filter((q) => focusValueOf(q, focus.column) === focus.value).length : 0;
-  const colSpan = (canKill ? 1 : 0) + 6 + (canKill ? 1 : 0);
+  const colSpan = (canKill ? 1 : 0) + 7 + (canKill ? 1 : 0);
 
   return (
     <table>
@@ -323,6 +327,7 @@ function QueryTable({
         <tr>
           {canKill && <th></th>}
           <ColumnHeader label="Duration" sortKey="duration" activeSortKey={sortKey} activeSortDir={sortDir} onSort={handleSort} />
+          <th>Process ID</th>
           <th>Machine</th>
           <ColumnHeader
             label="Database"
@@ -377,12 +382,35 @@ function QueryTable({
                 </td>
               )}
               <td className={durationClass(q.durationSeconds)}>{formatDuration(q.durationSeconds)}</td>
+              <td style={{ whiteSpace: "nowrap" }}>
+                {q.processId}
+                <CopyButton text={String(q.processId)} label="Copy" title="Copy process ID" />
+              </td>
               <td>{q.connectionName}</td>
               <td>{q.database ?? <span className="muted">—</span>}</td>
               <td>{q.dbUsername}</td>
               <td className="muted">{q.clientHost ?? "—"}</td>
               <td className="muted">{q.state ?? q.command}</td>
-              <td className="query-text">{q.queryText ?? <span className="muted">(no text captured)</span>}</td>
+              <td className="query-cell">
+                <QueryPreview
+                  text={q.queryText}
+                  onView={() =>
+                    onView({
+                      processId: q.processId,
+                      meta: [
+                        q.connectionName,
+                        q.dbUsername,
+                        q.database,
+                        q.clientHost,
+                        `running ${formatDuration(q.durationSeconds)}`,
+                      ]
+                        .filter(Boolean)
+                        .join(" · "),
+                      queryText: q.queryText ?? "",
+                    })
+                  }
+                />
+              </td>
               {canKill && (
                 <td>
                   <Link
@@ -452,7 +480,17 @@ function applyLockFocus(lockWaits: LockWait[], focus: LockFocus | null): LockWai
   return [...pinned, ...rest];
 }
 
-function LockWaitTable({ lockWaits, canKill, machineId }: { lockWaits: LockWait[]; canKill: boolean; machineId: string }) {
+function LockWaitTable({
+  lockWaits,
+  canKill,
+  machineId,
+  onView,
+}: {
+  lockWaits: LockWait[];
+  canKill: boolean;
+  machineId: string;
+  onView: (target: ViewQueryTarget) => void;
+}) {
   const [focus, setFocus] = useState<LockFocus | null>(null);
 
   useEffect(() => {
@@ -515,26 +553,54 @@ function LockWaitTable({ lockWaits, canKill, machineId }: { lockWaits: LockWait[
               <tr style={focus && i < pinnedCount ? { background: "var(--panel-2)" } : undefined}>
             <td className={durationClass(lw.waitSeconds)}>{formatDuration(lw.waitSeconds)}</td>
             <td>{lw.connectionName}</td>
-            <td>
+            <td className="query-cell-half">
               <div style={{ marginBottom: 4 }}>
-                <strong>#{lw.blockingPid}</strong> · {lw.blockingDbUsername ?? <span className="muted">unknown user</span>}
+                <strong>#{lw.blockingPid}</strong>
+                <CopyButton text={String(lw.blockingPid)} title="Copy process ID" /> ·{" "}
+                {lw.blockingDbUsername ?? <span className="muted">unknown user</span>}
                 {lw.blockingDatabase ? <> · {lw.blockingDatabase}</> : null}
               </div>
               {lw.blockingQuery ? (
-                <div className="query-text">{lw.blockingQuery}</div>
+                <QueryPreview
+                  text={lw.blockingQuery}
+                  onView={() =>
+                    onView({
+                      processId: lw.blockingPid,
+                      title: `Blocking session #${lw.blockingPid}`,
+                      meta: [lw.connectionName, lw.blockingDbUsername, lw.blockingDatabase, lw.blockingClientHost]
+                        .filter(Boolean)
+                        .join(" · "),
+                      queryText: lw.blockingQuery ?? "",
+                    })
+                  }
+                />
               ) : (
                 <span className="muted">
                   (idle — no statement running, but the transaction is still open and holding the lock)
                 </span>
               )}
             </td>
-            <td>
+            <td className="query-cell-half">
               <div style={{ marginBottom: 4 }}>
-                <strong>#{lw.waitingPid}</strong> · {lw.waitingDbUsername ?? <span className="muted">unknown user</span>}
+                <strong>#{lw.waitingPid}</strong>
+                <CopyButton text={String(lw.waitingPid)} title="Copy process ID" /> ·{" "}
+                {lw.waitingDbUsername ?? <span className="muted">unknown user</span>}
                 {lw.waitingDatabase ? <> · {lw.waitingDatabase}</> : null}
               </div>
               {lw.waitingQuery ? (
-                <div className="query-text">{lw.waitingQuery}</div>
+                <QueryPreview
+                  text={lw.waitingQuery}
+                  onView={() =>
+                    onView({
+                      processId: lw.waitingPid,
+                      title: `Waiting session #${lw.waitingPid}`,
+                      meta: [lw.connectionName, lw.waitingDbUsername, lw.waitingDatabase, lw.waitingClientHost]
+                        .filter(Boolean)
+                        .join(" · "),
+                      queryText: lw.waitingQuery ?? "",
+                    })
+                  }
+                />
               ) : (
                 <span className="muted">(no statement text captured)</span>
               )}
@@ -608,6 +674,7 @@ export default function QueryDashboard({ role }: { role: Role }) {
   // is cleared rather than silently carrying over.
   const [selectedMap, setSelectedMap] = useState<Map<string, RunningQuery>>(new Map());
   const [bulkModalOpen, setBulkModalOpen] = useState(false);
+  const [viewing, setViewing] = useState<ViewQueryTarget | null>(null);
 
   useEffect(() => {
     setSelectedMap(new Map());
@@ -776,7 +843,7 @@ export default function QueryDashboard({ role }: { role: Role }) {
         {loading && queries.length === 0 && lockWaits.length === 0 ? (
           <p className="muted">Loading…</p>
         ) : (
-          <LockWaitTable lockWaits={lockWaits} canKill={canKill} machineId={selected} />
+          <LockWaitTable lockWaits={lockWaits} canKill={canKill} machineId={selected} onView={setViewing} />
         )}
       </div>
 
@@ -795,6 +862,7 @@ export default function QueryDashboard({ role }: { role: Role }) {
             selected={new Set(selectedMap.keys())}
             onToggleSelect={toggleSelect}
             machineId={selected}
+            onView={setViewing}
           />
         )}
       </div>
@@ -814,9 +882,12 @@ export default function QueryDashboard({ role }: { role: Role }) {
             selected={new Set(selectedMap.keys())}
             onToggleSelect={toggleSelect}
             machineId={selected}
+            onView={setViewing}
           />
         )}
       </div>
+
+      {viewing && <ViewQueryModal target={viewing} onClose={() => setViewing(null)} />}
 
       {bulkModalOpen && (
         <BulkKillModal

@@ -1,0 +1,388 @@
+diff --git a/src/app/globals.css b/src/app/globals.css
+index 8939d52..6b350cc 100644
+--- a/src/app/globals.css
++++ b/src/app/globals.css
+@@ -64,6 +64,9 @@ a { color: var(--accent); }
+   border: 1px solid var(--border);
+   border-radius: 10px;
+   padding: 20px;
++  /* A table that's wider than the card (many columns on a narrow screen)
++     scrolls inside the card instead of spilling past its edge. */
++  overflow-x: auto;
+ }
+ 
+ table { width: 100%; border-collapse: collapse; font-size: 14px; }
+@@ -167,6 +170,56 @@ label { display: block; font-size: 13px; color: var(--text-dim); margin-bottom:
+   max-height: 160px;
+   overflow-y: auto;
+ }
++/* Dashboard query cells: show as much SQL as fits across the available
++   width, wrapped, capped at 3 lines so production-size queries don't eat
++   the screen vertically. "View query" opens the whole thing. */
++td.query-cell { width: 100%; min-width: 200px; }
++td.query-cell-half { min-width: 220px; }
++.query-preview {
++  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
++  font-size: 12.5px;
++  white-space: normal;
++  word-break: break-word;
++  display: -webkit-box;
++  -webkit-box-orient: vertical;
++  -webkit-line-clamp: 3;
++  line-clamp: 3;
++  overflow: hidden;
++}
++.link-btn {
++  background: none;
++  border: none;
++  padding: 0;
++  margin-top: 4px;
++  font-size: 12px;
++  font-weight: 600;
++  color: var(--accent);
++  text-decoration: underline;
++}
++.copy-btn {
++  background: transparent;
++  border: 1px solid var(--border);
++  color: var(--text-dim);
++  padding: 1px 7px;
++  margin-left: 6px;
++  font-size: 11px;
++  font-weight: 600;
++  border-radius: 5px;
++  vertical-align: middle;
++}
++.modal-box.modal-wide { max-width: 920px; border-color: var(--border); }
++.query-full {
++  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
++  font-size: 13px;
++  white-space: pre-wrap;
++  word-break: break-word;
++  background: #0a0e17;
++  border: 1px solid var(--border);
++  border-radius: 8px;
++  padding: 14px;
++  max-height: calc(100vh - 220px);
++  overflow-y: auto;
++}
+ .confirm-input {
+   width: 100%;
+   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+diff --git a/src/components/QueryDashboard.tsx b/src/components/QueryDashboard.tsx
+index e81da22..09a68c7 100644
+--- a/src/components/QueryDashboard.tsx
++++ b/src/components/QueryDashboard.tsx
+@@ -4,6 +4,7 @@ import { Fragment, useEffect, useState, useCallback, useMemo } from "react";
+ import Link from "next/link";
+ import type { Role } from "@/lib/types";
+ import BulkKillModal, { type BulkKillTarget } from "@/components/BulkKillModal";
++import { CopyButton, QueryPreview, ViewQueryModal, type ViewQueryTarget } from "@/components/QueryPreview";
+ 
+ interface Machine {
+   id: string;
+@@ -261,10 +262,13 @@ function QueryTable({
+   selected,
+   onToggleSelect,
+   machineId,
++  onView,
+ }: {
+   queries: RunningQuery[];
+   canKill: boolean;
+   emptyMessage: string;
++  /** Opens the "View query" popup for a row (state lives in QueryDashboard so the popup survives the row finishing). */
++  onView: (target: ViewQueryTarget) => void;
+   /** Keys (rowKey(q)) of currently selected rows, for bulk-kill. No "select all" — see BulkKillModal for why each row is picked deliberately. */
+   selected: Set<string>;
+   onToggleSelect: (query: RunningQuery) => void;
+@@ -315,7 +319,7 @@ function QueryTable({
+   const sorted = sortQueries(queries, sortKey, sortDir);
+   const final = applyFocus(sorted, focus);
+   const pinnedCount = focus ? final.filter((q) => focusValueOf(q, focus.column) === focus.value).length : 0;
+-  const colSpan = (canKill ? 1 : 0) + 6 + (canKill ? 1 : 0);
++  const colSpan = (canKill ? 1 : 0) + 7 + (canKill ? 1 : 0);
+ 
+   return (
+     <table>
+@@ -323,6 +327,7 @@ function QueryTable({
+         <tr>
+           {canKill && <th></th>}
+           <ColumnHeader label="Duration" sortKey="duration" activeSortKey={sortKey} activeSortDir={sortDir} onSort={handleSort} />
++          <th>Process ID</th>
+           <th>Machine</th>
+           <ColumnHeader
+             label="Database"
+@@ -377,12 +382,35 @@ function QueryTable({
+                 </td>
+               )}
+               <td className={durationClass(q.durationSeconds)}>{formatDuration(q.durationSeconds)}</td>
++              <td style={{ whiteSpace: "nowrap" }}>
++                {q.processId}
++                <CopyButton text={String(q.processId)} label="Copy" title="Copy process ID" />
++              </td>
+               <td>{q.connectionName}</td>
+               <td>{q.database ?? <span className="muted">—</span>}</td>
+               <td>{q.dbUsername}</td>
+               <td className="muted">{q.clientHost ?? "—"}</td>
+               <td className="muted">{q.state ?? q.command}</td>
+-              <td className="query-text">{q.queryText ?? <span className="muted">(no text captured)</span>}</td>
++              <td className="query-cell">
++                <QueryPreview
++                  text={q.queryText}
++                  onView={() =>
++                    onView({
++                      processId: q.processId,
++                      meta: [
++                        q.connectionName,
++                        q.dbUsername,
++                        q.database,
++                        q.clientHost,
++                        `running ${formatDuration(q.durationSeconds)}`,
++                      ]
++                        .filter(Boolean)
++                        .join(" · "),
++                      queryText: q.queryText ?? "",
++                    })
++                  }
++                />
++              </td>
+               {canKill && (
+                 <td>
+                   <Link
+@@ -452,7 +480,17 @@ function applyLockFocus(lockWaits: LockWait[], focus: LockFocus | null): LockWai
+   return [...pinned, ...rest];
+ }
+ 
+-function LockWaitTable({ lockWaits, canKill, machineId }: { lockWaits: LockWait[]; canKill: boolean; machineId: string }) {
++function LockWaitTable({
++  lockWaits,
++  canKill,
++  machineId,
++  onView,
++}: {
++  lockWaits: LockWait[];
++  canKill: boolean;
++  machineId: string;
++  onView: (target: ViewQueryTarget) => void;
++}) {
+   const [focus, setFocus] = useState<LockFocus | null>(null);
+ 
+   useEffect(() => {
+@@ -515,26 +553,54 @@ function LockWaitTable({ lockWaits, canKill, machineId }: { lockWaits: LockWait[
+               <tr style={focus && i < pinnedCount ? { background: "var(--panel-2)" } : undefined}>
+             <td className={durationClass(lw.waitSeconds)}>{formatDuration(lw.waitSeconds)}</td>
+             <td>{lw.connectionName}</td>
+-            <td>
++            <td className="query-cell-half">
+               <div style={{ marginBottom: 4 }}>
+-                <strong>#{lw.blockingPid}</strong> · {lw.blockingDbUsername ?? <span className="muted">unknown user</span>}
++                <strong>#{lw.blockingPid}</strong>
++                <CopyButton text={String(lw.blockingPid)} title="Copy process ID" /> ·{" "}
++                {lw.blockingDbUsername ?? <span className="muted">unknown user</span>}
+                 {lw.blockingDatabase ? <> · {lw.blockingDatabase}</> : null}
+               </div>
+               {lw.blockingQuery ? (
+-                <div className="query-text">{lw.blockingQuery}</div>
++                <QueryPreview
++                  text={lw.blockingQuery}
++                  onView={() =>
++                    onView({
++                      processId: lw.blockingPid,
++                      title: `Blocking session #${lw.blockingPid}`,
++                      meta: [lw.connectionName, lw.blockingDbUsername, lw.blockingDatabase, lw.blockingClientHost]
++                        .filter(Boolean)
++                        .join(" · "),
++                      queryText: lw.blockingQuery ?? "",
++                    })
++                  }
++                />
+               ) : (
+                 <span className="muted">
+                   (idle — no statement running, but the transaction is still open and holding the lock)
+                 </span>
+               )}
+             </td>
+-            <td>
++            <td className="query-cell-half">
+               <div style={{ marginBottom: 4 }}>
+-                <strong>#{lw.waitingPid}</strong> · {lw.waitingDbUsername ?? <span className="muted">unknown user</span>}
++                <strong>#{lw.waitingPid}</strong>
++                <CopyButton text={String(lw.waitingPid)} title="Copy process ID" /> ·{" "}
++                {lw.waitingDbUsername ?? <span className="muted">unknown user</span>}
+                 {lw.waitingDatabase ? <> · {lw.waitingDatabase}</> : null}
+               </div>
+               {lw.waitingQuery ? (
+-                <div className="query-text">{lw.waitingQuery}</div>
++                <QueryPreview
++                  text={lw.waitingQuery}
++                  onView={() =>
++                    onView({
++                      processId: lw.waitingPid,
++                      title: `Waiting session #${lw.waitingPid}`,
++                      meta: [lw.connectionName, lw.waitingDbUsername, lw.waitingDatabase, lw.waitingClientHost]
++                        .filter(Boolean)
++                        .join(" · "),
++                      queryText: lw.waitingQuery ?? "",
++                    })
++                  }
++                />
+               ) : (
+                 <span className="muted">(no statement text captured)</span>
+               )}
+@@ -608,6 +674,7 @@ export default function QueryDashboard({ role }: { role: Role }) {
+   // is cleared rather than silently carrying over.
+   const [selectedMap, setSelectedMap] = useState<Map<string, RunningQuery>>(new Map());
+   const [bulkModalOpen, setBulkModalOpen] = useState(false);
++  const [viewing, setViewing] = useState<ViewQueryTarget | null>(null);
+ 
+   useEffect(() => {
+     setSelectedMap(new Map());
+@@ -776,7 +843,7 @@ export default function QueryDashboard({ role }: { role: Role }) {
+         {loading && queries.length === 0 && lockWaits.length === 0 ? (
+           <p className="muted">Loading…</p>
+         ) : (
+-          <LockWaitTable lockWaits={lockWaits} canKill={canKill} machineId={selected} />
++          <LockWaitTable lockWaits={lockWaits} canKill={canKill} machineId={selected} onView={setViewing} />
+         )}
+       </div>
+ 
+@@ -795,6 +862,7 @@ export default function QueryDashboard({ role }: { role: Role }) {
+             selected={new Set(selectedMap.keys())}
+             onToggleSelect={toggleSelect}
+             machineId={selected}
++            onView={setViewing}
+           />
+         )}
+       </div>
+@@ -814,10 +882,13 @@ export default function QueryDashboard({ role }: { role: Role }) {
+             selected={new Set(selectedMap.keys())}
+             onToggleSelect={toggleSelect}
+             machineId={selected}
++            onView={setViewing}
+           />
+         )}
+       </div>
+ 
++      {viewing && <ViewQueryModal target={viewing} onClose={() => setViewing(null)} />}
++
+       {bulkModalOpen && (
+         <BulkKillModal
+           connectionId={selected}
+diff --git a/src/components/QueryPreview.tsx b/src/components/QueryPreview.tsx
+new file mode 100644
+index 0000000..f3048f8
+--- /dev/null
++++ b/src/components/QueryPreview.tsx
+@@ -0,0 +1,112 @@
++"use client";
++
++import { useEffect, useRef, useState } from "react";
++
++/** Copies text to the clipboard. navigator.clipboard only exists in secure
++ * contexts (https or localhost) — an on-prem install served over plain http
++ * wouldn't have it, so fall back to the old textarea + execCommand trick. */
++export async function copyText(text: string): Promise<boolean> {
++  try {
++    if (navigator.clipboard && window.isSecureContext) {
++      await navigator.clipboard.writeText(text);
++      return true;
++    }
++  } catch {
++    // fall through to the fallback below
++  }
++  try {
++    const ta = document.createElement("textarea");
++    ta.value = text;
++    ta.style.position = "fixed";
++    ta.style.opacity = "0";
++    document.body.appendChild(ta);
++    ta.select();
++    const ok = document.execCommand("copy");
++    document.body.removeChild(ta);
++    return ok;
++  } catch {
++    return false;
++  }
++}
++
++export function CopyButton({ text, label = "Copy", title }: { text: string; label?: string; title?: string }) {
++  const [state, setState] = useState<"idle" | "copied" | "failed">("idle");
++  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
++
++  useEffect(
++    () => () => {
++      if (timer.current) clearTimeout(timer.current);
++    },
++    []
++  );
++
++  async function onClick() {
++    const ok = await copyText(text);
++    setState(ok ? "copied" : "failed");
++    if (timer.current) clearTimeout(timer.current);
++    timer.current = setTimeout(() => setState("idle"), 1500);
++  }
++
++  return (
++    <button type="button" className="copy-btn" onClick={onClick} title={title ?? "Copy to clipboard"}>
++      {state === "copied" ? "Copied" : state === "failed" ? "Failed" : label}
++    </button>
++  );
++}
++
++/** What the "View query" popup shows. Captured as a snapshot at click time
++ * (not a live reference to the row), so the popup stays put even if the
++ * query finishes and drops off the dashboard while it's being read. */
++export interface ViewQueryTarget {
++  processId: number;
++  title?: string;
++  meta: string;
++  queryText: string;
++}
++
++/** Compact, horizontally-wrapped preview (a few lines max) with a link to
++ * open the whole thing. Keeps very long production queries from taking
++ * over the screen vertically. */
++export function QueryPreview({ text, onView }: { text: string | null; onView: () => void }) {
++  if (!text) return <span className="muted">(no text captured)</span>;
++  return (
++    <div>
++      <div className="query-preview">{text}</div>
++      <button type="button" className="link-btn" onClick={onView}>
++        View query
++      </button>
++    </div>
++  );
++}
++
++export function ViewQueryModal({ target, onClose }: { target: ViewQueryTarget; onClose: () => void }) {
++  useEffect(() => {
++    function onKey(e: KeyboardEvent) {
++      if (e.key === "Escape") onClose();
++    }
++    window.addEventListener("keydown", onKey);
++    return () => window.removeEventListener("keydown", onKey);
++  }, [onClose]);
++
++  return (
++    <div className="modal-overlay" onClick={onClose}>
++      <div className="modal-box modal-wide" onClick={(e) => e.stopPropagation()}>
++        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12 }}>
++          <div>
++            <h2>{target.title ?? `Query #${target.processId}`}</h2>
++            <p className="muted" style={{ fontSize: 13, margin: "0 0 14px" }}>
++              {target.meta}
++            </p>
++          </div>
++          <div style={{ display: "flex", gap: 8 }}>
++            <CopyButton text={target.queryText} label="Copy query" />
++            <button type="button" className="secondary" onClick={onClose}>
++              Close
++            </button>
++          </div>
++        </div>
++        <div className="query-full">{target.queryText}</div>
++      </div>
++    </div>
++  );
++}
