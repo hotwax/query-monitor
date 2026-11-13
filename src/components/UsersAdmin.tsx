@@ -16,7 +16,7 @@ interface UserRow {
 
 const emptyForm = { username: "", name: "", email: "", role: "DEVELOPER" as Role };
 
-export default function UsersAdmin() {
+export default function UsersAdmin({ currentUserId }: { currentUserId: string }) {
   const [users, setUsers] = useState<UserRow[]>([]);
   const [form, setForm] = useState(emptyForm);
   const [error, setError] = useState<string | null>(null);
@@ -96,6 +96,29 @@ export default function UsersAdmin() {
     }
   }
 
+  async function deleteUser(user: UserRow) {
+    const what =
+      user.status === "INVITED"
+        ? `Delete the pending invite for ${user.email}?`
+        : `Permanently delete ${user.name} (${user.email})? This can't be undone. Their past activity stays in the audit log. To block access but keep the account, use Disable instead.`;
+    if (!confirm(what)) return;
+    setBusyId(user.id);
+    setError(null);
+    setNotice(null);
+    try {
+      const res = await fetch(`/api/users/${user.id}`, { method: "DELETE" });
+      const data = await res.json();
+      if (!res.ok) {
+        setError(data.error ?? "Could not delete this user.");
+        return;
+      }
+      setNotice(`Deleted ${user.email}.`);
+      await load();
+    } finally {
+      setBusyId(null);
+    }
+  }
+
   async function resetMfa(user: UserRow) {
     if (!confirm(`Reset MFA for ${user.name}? They'll have to set up a new authenticator app on their next login.`)) return;
     setBusyId(user.id);
@@ -116,7 +139,7 @@ export default function UsersAdmin() {
   }
 
   return (
-    <div style={{ display: "grid", gridTemplateColumns: "1fr 380px", gap: 20 }}>
+    <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) 380px", gap: 20 }}>
       <div className="card">
         <p className="section-title">Users</p>
         {error && <div className="alert error">{error}</div>}
@@ -145,7 +168,7 @@ export default function UsersAdmin() {
                 <td className="muted">{u.status}</td>
                 <td className="muted">{u.mfaEnabled ? "✓ enabled" : "—"}</td>
                 <td>
-                  <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                  <div style={{ display: "flex", gap: 6, flexWrap: "nowrap", whiteSpace: "nowrap" }}>
                     {u.status === "INVITED" && (
                       <button className="secondary" disabled={busyId === u.id} onClick={() => resendInvite(u)}>
                         Resend invite
@@ -159,6 +182,11 @@ export default function UsersAdmin() {
                     {u.status !== "INVITED" && u.mfaEnabled && (
                       <button className="secondary" disabled={busyId === u.id} onClick={() => resetMfa(u)}>
                         Reset MFA
+                      </button>
+                    )}
+                    {u.id !== currentUserId && (
+                      <button className="danger" disabled={busyId === u.id} onClick={() => deleteUser(u)}>
+                        Delete
                       </button>
                     )}
                   </div>

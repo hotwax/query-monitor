@@ -42,6 +42,7 @@ export async function logAudit(params: {
     | "USER_INVITE_ACCEPTED"
     | "USER_DISABLED"
     | "USER_ENABLED"
+    | "USER_DELETED"
     // Slow query history (see /query-history and src/lib/slow-query-scanner.ts):
     | "SLOW_QUERY_TRACKING_ENABLED"
     | "SLOW_QUERY_TRACKING_DISABLED"

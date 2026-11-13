@@ -52,3 +52,47 @@ export async function PATCH(req: NextRequest, { params }: { params: { id: string
 
   return NextResponse.json({ ok: true, status: newStatus });
 }
+
+/**
+ * Permanently deletes a user account. Disable stays the right choice for
+ * normal offboarding (reversible); delete is for accounts that should not
+ * exist at all — a mistyped invite, someone who never joined, a test user.
+ *
+ * Past audit-log / kill-log rows are kept: AuditLog.actorId is
+ * ON DELETE SET NULL and every row also stores actorEmail, so "who killed
+ * what" stays readable after the account is gone.
+ */
+export async function DELETE(_req: NextRequest, { params }: { params: { id: string } }) {
+  const session = await getSession();
+  if (!session || !roleAllows(session.role, CAN_MANAGE_USERS)) {
+    return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+  }
+
+  const target = await prisma.user.findUnique({ where: { id: params.id } });
+  if (!target) {
+    return NextResponse.json({ error: "User not found." }, { status: 404 });
+  }
+
+  if (target.id === session.sub) {
+    return NextResponse.json({ error: "You can't delete your own account." }, { status: 400 });
+  }
+
+  if (target.role === "ADMIN" && target.status === "ACTIVE") {
+    const otherActiveAdmins = await prisma.user.count({
+      where: { role: "ADMIN", status: "ACTIVE", id: { not: target.id } },
+    });
+    if (otherActiveAdmins === 0) {
+      return NextResponse.json({ error: "Can't delete the last active admin account." }, { status: 400 });
+    }
+  }
+
+  await prisma.user.delete({ where: { id: target.id } });
+  await logAudit({
+    actorEmail: session.email,
+    actorId: session.sub,
+    action: "USER_DELETED",
+    detail: { targetUserId: target.id, targetEmail: target.email, targetRole: target.role, targetStatus: target.status },
+  });
+
+  return NextResponse.json({ ok: true });
+}

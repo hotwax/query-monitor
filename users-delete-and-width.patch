@@ -1,0 +1,152 @@
+diff --git a/src/app/admin/users/page.tsx b/src/app/admin/users/page.tsx
+index 90e2ad6..4af3c0d 100644
+--- a/src/app/admin/users/page.tsx
++++ b/src/app/admin/users/page.tsx
+@@ -12,8 +12,8 @@ export default async function UsersAdminPage() {
+   return (
+     <>
+       <TopBar email={session.email} role={session.role} />
+-      <div className="container">
+-        <UsersAdmin />
++      <div className="container" style={{ maxWidth: "none" }}>
++        <UsersAdmin currentUserId={session.sub} />
+       </div>
+     </>
+   );
+diff --git a/src/app/api/users/[id]/route.ts b/src/app/api/users/[id]/route.ts
+index ca11c5c..b052f3d 100644
+--- a/src/app/api/users/[id]/route.ts
++++ b/src/app/api/users/[id]/route.ts
+@@ -52,3 +52,47 @@ export async function PATCH(req: NextRequest, { params }: { params: { id: string
+ 
+   return NextResponse.json({ ok: true, status: newStatus });
+ }
++
++/**
++ * Permanently deletes a user account. Disable stays the right choice for
++ * normal offboarding (reversible); delete is for accounts that should not
++ * exist at all — a mistyped invite, someone who never joined, a test user.
++ *
++ * Past audit-log / kill-log rows are kept: AuditLog.actorId is
++ * ON DELETE SET NULL and every row also stores actorEmail, so "who killed
++ * what" stays readable after the account is gone.
++ */
++export async function DELETE(_req: NextRequest, { params }: { params: { id: string } }) {
++  const session = await getSession();
++  if (!session || !roleAllows(session.role, CAN_MANAGE_USERS)) {
++    return NextResponse.json({ error: "Forbidden" }, { status: 403 });
++  }
++
++  const target = await prisma.user.findUnique({ where: { id: params.id } });
++  if (!target) {
++    return NextResponse.json({ error: "User not found." }, { status: 404 });
++  }
++
++  if (target.id === session.sub) {
++    return NextResponse.json({ error: "You can't delete your own account." }, { status: 400 });
++  }
++
++  if (target.role === "ADMIN" && target.status === "ACTIVE") {
++    const otherActiveAdmins = await prisma.user.count({
++      where: { role: "ADMIN", status: "ACTIVE", id: { not: target.id } },
++    });
++    if (otherActiveAdmins === 0) {
++      return NextResponse.json({ error: "Can't delete the last active admin account." }, { status: 400 });
++    }
++  }
++
++  await prisma.user.delete({ where: { id: target.id } });
++  await logAudit({
++    actorEmail: session.email,
++    actorId: session.sub,
++    action: "USER_DELETED",
++    detail: { targetUserId: target.id, targetEmail: target.email, targetRole: target.role, targetStatus: target.status },
++  });
++
++  return NextResponse.json({ ok: true });
++}
+diff --git a/src/components/UsersAdmin.tsx b/src/components/UsersAdmin.tsx
+index dc35f82..105c54b 100644
+--- a/src/components/UsersAdmin.tsx
++++ b/src/components/UsersAdmin.tsx
+@@ -16,7 +16,7 @@ interface UserRow {
+ 
+ const emptyForm = { username: "", name: "", email: "", role: "DEVELOPER" as Role };
+ 
+-export default function UsersAdmin() {
++export default function UsersAdmin({ currentUserId }: { currentUserId: string }) {
+   const [users, setUsers] = useState<UserRow[]>([]);
+   const [form, setForm] = useState(emptyForm);
+   const [error, setError] = useState<string | null>(null);
+@@ -96,6 +96,29 @@ export default function UsersAdmin() {
+     }
+   }
+ 
++  async function deleteUser(user: UserRow) {
++    const what =
++      user.status === "INVITED"
++        ? `Delete the pending invite for ${user.email}?`
++        : `Permanently delete ${user.name} (${user.email})? This can't be undone. Their past activity stays in the audit log. To block access but keep the account, use Disable instead.`;
++    if (!confirm(what)) return;
++    setBusyId(user.id);
++    setError(null);
++    setNotice(null);
++    try {
++      const res = await fetch(`/api/users/${user.id}`, { method: "DELETE" });
++      const data = await res.json();
++      if (!res.ok) {
++        setError(data.error ?? "Could not delete this user.");
++        return;
++      }
++      setNotice(`Deleted ${user.email}.`);
++      await load();
++    } finally {
++      setBusyId(null);
++    }
++  }
++
+   async function resetMfa(user: UserRow) {
+     if (!confirm(`Reset MFA for ${user.name}? They'll have to set up a new authenticator app on their next login.`)) return;
+     setBusyId(user.id);
+@@ -116,7 +139,7 @@ export default function UsersAdmin() {
+   }
+ 
+   return (
+-    <div style={{ display: "grid", gridTemplateColumns: "1fr 380px", gap: 20 }}>
++    <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) 380px", gap: 20 }}>
+       <div className="card">
+         <p className="section-title">Users</p>
+         {error && <div className="alert error">{error}</div>}
+@@ -145,7 +168,7 @@ export default function UsersAdmin() {
+                 <td className="muted">{u.status}</td>
+                 <td className="muted">{u.mfaEnabled ? "✓ enabled" : "—"}</td>
+                 <td>
+-                  <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
++                  <div style={{ display: "flex", gap: 6, flexWrap: "nowrap", whiteSpace: "nowrap" }}>
+                     {u.status === "INVITED" && (
+                       <button className="secondary" disabled={busyId === u.id} onClick={() => resendInvite(u)}>
+                         Resend invite
+@@ -161,6 +184,11 @@ export default function UsersAdmin() {
+                         Reset MFA
+                       </button>
+                     )}
++                    {u.id !== currentUserId && (
++                      <button className="danger" disabled={busyId === u.id} onClick={() => deleteUser(u)}>
++                        Delete
++                      </button>
++                    )}
+                   </div>
+                 </td>
+               </tr>
+diff --git a/src/lib/audit.ts b/src/lib/audit.ts
+index 1de7284..323f338 100644
+--- a/src/lib/audit.ts
++++ b/src/lib/audit.ts
+@@ -42,6 +42,7 @@ export async function logAudit(params: {
+     | "USER_INVITE_ACCEPTED"
+     | "USER_DISABLED"
+     | "USER_ENABLED"
++    | "USER_DELETED"
+     // Slow query history (see /query-history and src/lib/slow-query-scanner.ts):
+     | "SLOW_QUERY_TRACKING_ENABLED"
+     | "SLOW_QUERY_TRACKING_DISABLED"

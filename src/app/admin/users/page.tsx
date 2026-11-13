@@ -12,8 +12,8 @@ export default async function UsersAdminPage() {
   return (
     <>
       <TopBar email={session.email} role={session.role} />
-      <div className="container">
-        <UsersAdmin />
+      <div className="container" style={{ maxWidth: "none" }}>
+        <UsersAdmin currentUserId={session.sub} />
       </div>
     </>
   );
